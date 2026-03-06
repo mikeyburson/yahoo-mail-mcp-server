@@ -8,7 +8,9 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import crypto from 'crypto';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import express from 'express';
@@ -48,13 +50,10 @@ class YahooMailMCPServer {
     }
 
     /**
-     * Setup MCP tool handlers
+     * Returns the tool definitions array (shared between legacy SSE and Streamable HTTP)
      */
-    setupToolHandlers() {
-        // Handle tool listing
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-            return {
-                tools: [
+    getToolDefinitions() {
+        return [
                     {
                         name: 'list_emails',
                         description: 'List recent emails from a Yahoo Mail folder. Returns UIDs (permanent identifiers) and enriched metadata including size, flags, and attachment status.',
@@ -304,16 +303,15 @@ class YahooMailMCPServer {
                             properties: {}
                         }
                     }
-                ]
-            };
-        });
+                ];
+    }
 
-        // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-            const { name, arguments: args } = request.params;
-
-            try {
-                switch (name) {
+    /**
+     * Handles a tool call by name and args (shared between legacy SSE and Streamable HTTP)
+     */
+    async handleToolCall(name, args) {
+        try {
+            switch (name) {
                     case 'list_emails':
                         return await this.listEmails(args?.count || 10, args?.folder || 'INBOX', args?.offset || 0);
 
@@ -367,6 +365,19 @@ class YahooMailMCPServer {
                     ]
                 };
             }
+    }
+
+    /**
+     * Setup MCP tool handlers on the primary server instance
+     */
+    setupToolHandlers() {
+        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+            return { tools: this.getToolDefinitions() };
+        });
+
+        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+            const { name, arguments: args } = request.params;
+            return await this.handleToolCall(name, args);
         });
     }
 
@@ -1273,10 +1284,14 @@ class YahooMailMCPServer {
         }));
 
         // Parse request bodies for different content types
-        // Skip /mcp/message which needs raw body for SSE
+        // Skip /mcp/message which needs raw body for legacy SSE
         app.use((req, res, next) => {
             if (req.path === '/mcp/message') {
                 return next();
+            }
+            // /mcp POST needs JSON parsing for Streamable HTTP
+            if (req.path === '/mcp' && req.method === 'POST') {
+                return express.json()(req, res, next);
             }
 
             // OAuth token endpoint needs both JSON and URL-encoded support
@@ -1300,9 +1315,10 @@ class YahooMailMCPServer {
 
         // Authentication middleware for MCP endpoints
         const authenticateMCP = (req, res, next) => {
-            // Skip auth for health check, OAuth endpoints, and discovery endpoints
+            // Skip auth for health check, OAuth endpoints, discovery endpoints, and streamable HTTP
             if (req.path === '/health' ||
                 req.path === '/' ||
+                req.path === '/mcp' ||
                 req.path.startsWith('/.well-known/') ||
                 req.path === '/register' ||
                 req.path.startsWith('/oauth/')) {
@@ -1649,6 +1665,106 @@ class YahooMailMCPServer {
                     console.error('[SSE] No active transport found');
                     res.status(404).json({ error: 'No active SSE connection found' });
                 }
+            }
+        });
+
+        // ========================================
+        // Streamable HTTP Transport (new protocol)
+        // ========================================
+        // This is the newer MCP transport that Claude.ai custom connectors use.
+        // It uses a single /mcp endpoint for POST (JSON-RPC), GET (SSE stream), and DELETE (session close).
+
+        // Store streamable HTTP transports by session ID
+        const streamableTransports = new Map();
+
+        // Helper: create a new MCP server instance for streamable HTTP sessions
+        const self = this;
+        const createStreamableServer = () => {
+            const server = new Server(
+                {
+                    name: 'yahoo-mail-mcp',
+                    version: '3.0.0',
+                },
+                {
+                    capabilities: {
+                        tools: {},
+                    },
+                }
+            );
+
+            // Register the same tool handlers on this new server instance
+            server.setRequestHandler(ListToolsRequestSchema, async () => {
+                return { tools: self.getToolDefinitions() };
+            });
+
+            server.setRequestHandler(CallToolRequestSchema, async (request) => {
+                const { name, arguments: args } = request.params;
+                return await self.handleToolCall(name, args);
+            });
+
+            return server;
+        };
+
+        app.post('/mcp', async (req, res) => {
+            console.error('[Streamable HTTP] POST /mcp received');
+            const sessionId = req.headers['mcp-session-id'];
+            console.error('[Streamable HTTP] Session ID from header:', sessionId);
+
+            let transport;
+
+            if (sessionId && streamableTransports.has(sessionId)) {
+                // Existing session
+                transport = streamableTransports.get(sessionId);
+            } else if (!sessionId) {
+                // New session - create transport and server
+                console.error('[Streamable HTTP] Creating new session');
+                transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => crypto.randomUUID(),
+                    onsessioninitialized: (id) => {
+                        console.error('[Streamable HTTP] Session initialized:', id);
+                        streamableTransports.set(id, transport);
+                    },
+                    onsessionclosed: (id) => {
+                        console.error('[Streamable HTTP] Session closed:', id);
+                        streamableTransports.delete(id);
+                    }
+                });
+
+                // Connect to a new server instance
+                const server = createStreamableServer();
+                await server.connect(transport);
+            } else {
+                // Invalid session ID
+                console.error('[Streamable HTTP] Invalid session ID:', sessionId);
+                res.status(404).json({ error: 'Session not found' });
+                return;
+            }
+
+            await transport.handleRequest(req, res, req.body);
+        });
+
+        app.get('/mcp', async (req, res) => {
+            console.error('[Streamable HTTP] GET /mcp (SSE stream)');
+            const sessionId = req.headers['mcp-session-id'];
+
+            if (sessionId && streamableTransports.has(sessionId)) {
+                const transport = streamableTransports.get(sessionId);
+                await transport.handleRequest(req, res);
+            } else {
+                res.status(400).json({ error: 'Invalid or missing session ID' });
+            }
+        });
+
+        app.delete('/mcp', async (req, res) => {
+            console.error('[Streamable HTTP] DELETE /mcp (session close)');
+            const sessionId = req.headers['mcp-session-id'];
+
+            if (sessionId && streamableTransports.has(sessionId)) {
+                const transport = streamableTransports.get(sessionId);
+                await transport.handleRequest(req, res);
+                streamableTransports.delete(sessionId);
+            } else {
+                res.status(404).json({ error: 'Session not found' });
             }
         });
 
