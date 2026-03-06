@@ -899,7 +899,7 @@ class YahooMailMCPServer {
     /**
      * Helper method for batch email modification operations using UIDs
      */
-    async modifyEmails(uids, operation, operationName, folder = 'INBOX') {
+    async modifyEmails(uids, operation, operationName, folder = 'INBOX', account = 1) {
         // Validate input
         const validationError = this.validateUIDs(uids);
         if (validationError) {
@@ -1105,7 +1105,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.addFlags(source, '\\Seen', callback),  // NO .seq
             'marked as read',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1117,7 +1118,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.delFlags(source, '\\Seen', callback),  // NO .seq
             'marked as unread',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1129,7 +1131,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.addFlags(source, '\\Flagged', callback),  // NO .seq
             'flagged',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1141,7 +1144,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.delFlags(source, '\\Flagged', callback),  // NO .seq
             'unflagged',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1153,7 +1157,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.move(source, 'Trash', callback),  // NO .seq
             'moved to Trash',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1165,7 +1170,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.move(source, 'Archive', callback),  // NO .seq
             'archived',
-            folder
+            folder,
+            account
         );
     }
 
@@ -1177,7 +1183,8 @@ class YahooMailMCPServer {
             uids,
             (imap, source, callback) => imap.move(source, folderName, callback),  // NO .seq
             `moved to ${folderName}`,
-            sourceFolder
+            sourceFolder,
+            account
         );
     }
 
