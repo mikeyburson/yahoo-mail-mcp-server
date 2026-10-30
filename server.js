@@ -20,7 +20,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file (for local development)
-dotenv.config();
+dotenv.config({ quiet: true });
 
 // Maximum attachment size returned (base64-encoded) by get_attachments
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
