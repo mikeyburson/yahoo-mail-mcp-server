@@ -55,9 +55,7 @@ describe('HTTP mode: health, root and discovery endpoints', () => {
         assert.ok(Array.isArray(body.tools));
     });
 
-    it('/ lists every tool the server actually exposes', {
-        todo: 'root endpoint tool list is hard-coded and omits list_folders (server.js "Root endpoint")'
-    }, async () => {
+    it('/ lists every tool the server actually exposes', async () => {
         const body = await getJson('/');
         assert.deepEqual([...body.tools].sort(), [...EXPECTED_TOOLS].sort());
     });
@@ -106,9 +104,7 @@ describe('HTTP mode: health, root and discovery endpoints', () => {
             assert.ok(Array.isArray(meta.authorization_servers) && meta.authorization_servers.length > 0);
         });
 
-        it('/.well-known/oauth-protected-resource/mcp exists for the Streamable HTTP endpoint', {
-            todo: 'no protected-resource metadata is served for /mcp (only /mcp/sse); MCP clients probe this path'
-        }, async () => {
+        it('/.well-known/oauth-protected-resource/mcp exists for the Streamable HTTP endpoint', async () => {
             const meta = await getJson('/.well-known/oauth-protected-resource/mcp');
             assert.equal(new URL(meta.resource).pathname, '/mcp');
         });

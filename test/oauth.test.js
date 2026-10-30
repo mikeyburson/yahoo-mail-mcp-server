@@ -78,9 +78,7 @@ describe('OAuth 2.0 authorization code + PKCE flow', () => {
             'https://attacker.example/cb?next=claude.ai',
             'https://attacker.example/localhost'
         ]) {
-            it(`rejects look-alike redirect_uri ${redirectUri}`, {
-                todo: 'redirect_uri is validated with substring includes() (server.js /oauth/authorize), so any URL containing "claude.ai"/"localhost" receives the code'
-            }, async () => {
+            it(`rejects look-alike redirect_uri ${redirectUri}`, async () => {
                 const res = await authorize(srv.baseUrl, { ...valid(), redirect_uri: redirectUri });
                 assert.equal(res.status, 400);
             });
@@ -176,9 +174,7 @@ describe('OAuth 2.0 authorization code + PKCE flow', () => {
             assert.equal(ok.status, 200);
         });
 
-        it('rejects a redirect_uri that differs from the one used at /oauth/authorize', {
-            todo: 'token endpoint never compares redirect_uri with the stored value (RFC 6749 section 4.1.3)'
-        }, async () => {
+        it('rejects a redirect_uri that differs from the one used at /oauth/authorize', async () => {
             const { verifier, challenge } = makePkce();
             const { code } = await getAuthCode(srv.baseUrl, { challenge });
             const res = await exchangeCode(srv.baseUrl, {
@@ -237,9 +233,7 @@ describe('OAuth token endpoint robustness', () => {
         await srv?.stop();
     });
 
-    it('answers 400 (and stays up) when code_verifier is missing for a PKCE code', {
-        todo: 'createHash().update(undefined) throws inside the async /oauth/token handler; Express 4 does not catch it, so the unhandled rejection crashes the server'
-    }, async () => {
+    it('answers 400 (and stays up) when code_verifier is missing for a PKCE code', async () => {
         const { challenge } = makePkce();
         const { code } = await getAuthCode(srv.baseUrl, { challenge });
         let res;
@@ -259,23 +253,5 @@ describe('OAuth token endpoint robustness', () => {
         assert.equal(res.body.error, 'invalid_grant');
         const health = await fetch(`${srv.baseUrl}/health`);
         assert.equal(health.status, 200);
-    });
-});
-
-describe('OAuth when the server has no client credentials configured', () => {
-    let srv;
-
-    before(async () => {
-        srv = await startHttpServer({ OAUTH_CLIENT_ID: undefined, OAUTH_CLIENT_SECRET: undefined });
-    });
-
-    after(async () => {
-        await srv?.stop();
-    });
-
-    it('/oauth/token returns 500 server_error instead of minting tokens', async () => {
-        const res = await tokenRequest(srv.baseUrl, { grant_type: 'client_credentials' });
-        assert.equal(res.status, 500);
-        assert.equal(res.body.error, 'server_error');
     });
 });

@@ -2824,6 +2824,7 @@ class YahooMailMCPServer {
                     'flag_emails',
                     'unflag_emails',
                     'move_emails',
+                    'list_folders',
                     'send_email',
                     'reply_email',
                     'get_attachments',

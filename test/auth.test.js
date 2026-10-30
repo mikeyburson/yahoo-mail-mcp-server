@@ -75,9 +75,7 @@ describe('authenticateMCP middleware', () => {
             await res.body?.cancel();
         });
 
-        it('401 responses carry a WWW-Authenticate challenge', {
-            todo: 'RFC 6750 section 3 / MCP auth spec require WWW-Authenticate (with resource_metadata) on 401; none is sent'
-        }, async () => {
+        it('401 responses carry a WWW-Authenticate challenge', async () => {
             const res = await fetch(`${srv.baseUrl}/mcp/sse`);
             await res.body?.cancel();
             assert.equal(res.status, 401);
@@ -114,16 +112,12 @@ describe('authenticateMCP middleware', () => {
     });
 
     describe('Streamable HTTP endpoint (/mcp)', () => {
-        it('POST /mcp without a token is rejected with 401', {
-            todo: 'authenticateMCP skips req.path === "/mcp", so the Streamable HTTP endpoint (and every tool) is reachable without any token'
-        }, async () => {
+        it('POST /mcp without a token is rejected with 401', async () => {
             const res = await mcpPost(srv.baseUrl, initializeRequest(1));
             assert.equal(res.status, 401);
         });
 
-        it('POST /mcp with an unknown bearer token is rejected with 401', {
-            todo: 'authenticateMCP skips req.path === "/mcp"; bearer tokens are never checked there'
-        }, async () => {
+        it('POST /mcp with an unknown bearer token is rejected with 401', async () => {
             const res = await mcpPost(srv.baseUrl, initializeRequest(1), { token: 'definitely-not-issued' });
             assert.equal(res.status, 401);
         });
@@ -149,9 +143,7 @@ describe('legacy SSE transport with concurrent clients', () => {
         await srv?.stop();
     });
 
-    it('routes each response to the SSE stream of the session that sent the request', {
-        todo: 'every /mcp/sse connection calls this.server.connect() on one shared Server, so responses go to the most recently connected client (cross-session leak)'
-    }, async () => {
+    it('routes each response to the SSE stream of the session that sent the request', async () => {
         const token = await getClientCredentialsToken(srv.baseUrl);
         const a = await connectLegacySSE(srv.baseUrl, token);
         const b = await connectLegacySSE(srv.baseUrl, token);
@@ -170,31 +162,11 @@ describe('legacy SSE transport with concurrent clients', () => {
     });
 });
 
-describe('server without OAuth credentials (explicitly unsecured mode)', () => {
-    let srv;
-
-    before(async () => {
-        srv = await startHttpServer({ OAUTH_CLIENT_ID: undefined, OAUTH_CLIENT_SECRET: undefined });
-    });
-
-    after(async () => {
-        await srv?.stop();
-    });
-
-    it('lets /mcp/sse through without a token and logs a warning', async () => {
-        const stream = await openSSE(`${srv.baseUrl}/mcp/sse`);
-        try {
-            assert.equal(stream.res.status, 200);
-            await stream.waitFor((e) => e.event === 'endpoint');
-        } finally {
-            stream.close();
-        }
-        assert.match(srv.stderr(), /OAuth not configured - server is UNSECURED/);
-    });
-
-    it('still reports the negotiated protocol on /mcp', async () => {
-        const res = await mcpPost(srv.baseUrl, initializeRequest(1));
-        assert.equal(res.status, 200);
-        assert.equal(res.messages[0].result.protocolVersion, PROTOCOL_VERSION);
+describe('server without OAuth credentials', () => {
+    it('refuses to start in HTTP mode instead of serving unauthenticated', async () => {
+        await assert.rejects(
+            startHttpServer({ OAUTH_CLIENT_ID: undefined, OAUTH_CLIENT_SECRET: undefined }),
+            /server exited early[\s\S]*FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set/
+        );
     });
 });
