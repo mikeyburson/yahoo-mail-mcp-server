@@ -1,39 +1,27 @@
 # Yahoo Mail MCP Server - Dockerfile
-# Multi-stage build for optimized production image
+# Multi-stage build: install production deps in one stage, copy into a clean runtime image.
+# All dependencies (imap, mailparser, express, MCP SDK) are pure JavaScript, so no
+# compiler toolchain (python3/make/g++) is needed in either stage.
 # Works on both Windows Docker Desktop and Linux Docker
 
-FROM node:22-alpine AS base
-
-# Install dependencies needed for native modules
-RUN apk add --no-cache \
-    python3 \
-    make \
-    g++ \
-    && rm -rf /var/cache/apk/*
+FROM node:24-alpine AS dependencies
 
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-FROM base AS dependencies
+FROM node:24-alpine AS production
 
-# Install all dependencies (including dev dependencies for building)
-RUN npm ci
-
-FROM base AS production
-
-# Copy only production dependencies
-COPY package*.json ./
-RUN npm ci --only=production
-
-# Copy application code
-COPY server.js ./
+WORKDIR /app
 
 # Create a non-root user for security
 RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001 && \
-    chown -R nodejs:nodejs /app
+    adduser -S nodejs -u 1001 -G nodejs
+
+# Copy production dependencies and application code
+COPY --from=dependencies --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --chown=nodejs:nodejs package*.json server.js ./
 
 USER nodejs
 

@@ -22,6 +22,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file (for local development)
+// quiet: dotenv 17 otherwise logs a banner to stdout, corrupting the stdio JSON-RPC stream
 dotenv.config({ quiet: true });
 
 // Maximum attachment size returned (base64-encoded) by get_attachments
@@ -2471,7 +2472,12 @@ class YahooMailMCPServer {
                     this.transports.delete(sessionId);
                 };
 
-                await this.server.connect(transport);
+                // A fresh Server per connection: SDK >=1.32 rejects connecting one Server to
+                // multiple transports, and sharing one leaks responses across clients
+                // (GHSA-345p-7cg4-v4c7). createStreamableServer is defined below in runSSE()
+                // and is initialized before any request can arrive.
+                const sessionServer = createStreamableServer();
+                await sessionServer.connect(transport);
                 console.error('[SSE] MCP server connected to transport');
             } catch (error) {
                 console.error('[SSE] Error connecting transport:', error);
@@ -2518,7 +2524,7 @@ class YahooMailMCPServer {
         // Store streamable HTTP transports by session ID
         const streamableTransports = new Map();
 
-        // Helper: create a new MCP server instance for streamable HTTP sessions
+        // Helper: create a new MCP server instance per session (Streamable HTTP and legacy SSE)
         const self = this;
         const createStreamableServer = () => {
             const server = new Server(
@@ -2542,6 +2548,10 @@ class YahooMailMCPServer {
                 const { name, arguments: args } = request.params;
                 return await self.handleToolCall(name, args);
             });
+
+            server.onerror = (error) => {
+                console.error('[MCP Error]', error);
+            };
 
             return server;
         };
