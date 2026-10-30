@@ -526,7 +526,7 @@ class YahooMailMCPServer {
             if (account !== 1 && account !== 2) throw new Error('account must be 1 or 2');
             switch (name) {
                     case 'list_emails':
-                        return await this.listEmails(args?.count || 10, args?.folder || 'INBOX', args?.offset || 0, account);
+                        return await this.listEmails(args?.count ?? 10, args?.folder || 'INBOX', args?.offset ?? 0, account);
 
                     case 'read_email':
                         return await this.readEmail(args.uids, args.folder, account);

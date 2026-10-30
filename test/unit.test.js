@@ -196,33 +196,25 @@ describe('handleToolCall: validation happens before any IMAP connection', () => 
         assert.match(text(result), /^Error: /);
     });
 
-    it('list_emails rejects count: 0', {
-        todo: '`args?.count || 10` turns count 0 into 10, so the "count must be at least 1" check never fires'
-    }, async () => {
+    it('list_emails rejects count: 0', async () => {
         const { server, imapCalls } = makeServer();
         assert.match(text(await server.handleToolCall('list_emails', { count: 0 })), /count must be at least 1/);
         assert.deepEqual(imapCalls, []);
     });
 
-    it('search_emails enforces the documented max count of 50', {
-        todo: 'search_emails schema says "max: 50" but only list_emails enforces it'
-    }, async () => {
+    it('search_emails enforces the documented max count of 50', async () => {
         const { server, imapCalls } = makeServer();
         assert.match(text(await server.handleToolCall('search_emails', { count: 51 })), /cannot exceed 50/);
         assert.deepEqual(imapCalls, []);
     });
 
-    it('move_emails requires folderName', {
-        todo: 'folderName is "required" in the schema but never checked; imap.move() is called with undefined'
-    }, async () => {
+    it('move_emails requires folderName', async () => {
         const { server, imapCalls } = makeServer();
         assert.match(text(await server.handleToolCall('move_emails', { uids: [1] })), /folderName/);
         assert.deepEqual(imapCalls, []);
     });
 
-    it('marks failures with isError: true', {
-        todo: 'handleToolCall returns errors as plain content without isError, so MCP clients cannot tell failure from success'
-    }, async () => {
+    it('marks failures with isError: true', async () => {
         const { server } = makeServer();
         assert.equal((await server.handleToolCall('nope', {})).isError, true);
         assert.equal((await server.handleToolCall('read_email', { uids: [] })).isError, true);
@@ -242,10 +234,8 @@ describe('account resolution', () => {
         assert.deepEqual(imapCalls, [1, 1, 2, 2, 2, 2, 2]);
     });
 
-    it('rejects account values other than 1 and 2 instead of silently using the primary mailbox', {
-        todo: 'createImapConnection maps anything !== 2 (e.g. 3, "2") to the primary account, so destructive tools can hit the wrong mailbox'
-    }, async () => {
-        for (const account of [3, '2', -1]) {
+    it('rejects account values other than 1 and 2 instead of silently using the primary mailbox', async () => {
+        for (const account of [3, 'abc', -1, 0, 1.5]) {
             const { server, imapCalls } = makeServer();
             const result = await server.handleToolCall('delete_emails', { uids: [1], account });
             assert.match(text(result), /account/i, `account=${JSON.stringify(account)}`);
