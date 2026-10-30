@@ -11,6 +11,8 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import crypto from 'crypto';
+import { realpathSync } from 'fs';
+import { fileURLToPath } from 'url';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
@@ -2654,6 +2656,18 @@ class YahooMailMCPServer {
     }
 }
 
-// Start the server
-const server = new YahooMailMCPServer();
-server.run().catch(console.error);
+export { YahooMailMCPServer };
+
+// Start the server only when run directly (`node server.js`), not when imported (e.g. by tests)
+const isEntryPoint = (() => {
+    try {
+        return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+})();
+
+if (isEntryPoint) {
+    const server = new YahooMailMCPServer();
+    server.run().catch(console.error);
+}
