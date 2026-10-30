@@ -64,6 +64,7 @@ class YahooMailMCPServer {
                     {
                         name: 'list_emails',
                         description: 'List recent emails from a Yahoo Mail folder. Returns UIDs (permanent identifiers) and enriched metadata including size, flags, and attachment status.',
+                        annotations: { title: 'List Emails', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -93,6 +94,7 @@ class YahooMailMCPServer {
                     {
                         name: 'read_email',
                         description: 'Read email content using UIDs (permanent identifiers). UIDs don\'t change when emails are deleted. Get UIDs from list_emails or search_emails.',
+                        annotations: { title: 'Read Email', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -119,6 +121,7 @@ class YahooMailMCPServer {
                     {
                         name: 'search_emails',
                         description: 'Search emails using UIDs with advanced filters. Returns UIDs which are permanent identifiers that don\'t change when emails are deleted. Get UIDs from results for subsequent operations.',
+                        annotations: { title: 'Search Emails', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -169,6 +172,7 @@ class YahooMailMCPServer {
                     {
                         name: 'delete_emails',
                         description: 'Move emails to Trash folder using UIDs (soft delete, recoverable). UIDs are permanent identifiers.',
+                        annotations: { title: 'Delete Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -195,6 +199,7 @@ class YahooMailMCPServer {
                     {
                         name: 'archive_emails',
                         description: 'Move emails to Archive folder using UIDs for long-term storage. UIDs are permanent identifiers.',
+                        annotations: { title: 'Archive Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -221,6 +226,7 @@ class YahooMailMCPServer {
                     {
                         name: 'mark_as_read',
                         description: 'Mark emails as read using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Mark as Read', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -247,6 +253,7 @@ class YahooMailMCPServer {
                     {
                         name: 'mark_as_unread',
                         description: 'Mark emails as unread using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Mark as Unread', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -273,6 +280,7 @@ class YahooMailMCPServer {
                     {
                         name: 'flag_emails',
                         description: 'Flag emails as important/starred using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Flag Emails', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -299,6 +307,7 @@ class YahooMailMCPServer {
                     {
                         name: 'unflag_emails',
                         description: 'Remove flag/star from emails using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Unflag Emails', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -325,6 +334,7 @@ class YahooMailMCPServer {
                     {
                         name: 'move_emails',
                         description: 'Move emails to a specified folder using UIDs. UIDs are permanent identifiers. Use list_folders to see available folders.',
+                        annotations: { title: 'Move Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -355,6 +365,7 @@ class YahooMailMCPServer {
                     {
                         name: 'list_folders',
                         description: 'List all available IMAP folders/mailboxes in your Yahoo Mail account',
+                        annotations: { title: 'List Folders', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -369,6 +380,7 @@ class YahooMailMCPServer {
                     {
                         name: 'send_email',
                         description: 'Send a new email immediately via Yahoo SMTP from the selected account. Yahoo normally saves a copy of SMTP-sent mail to the Sent folder automatically.',
+                        annotations: { title: 'Send Email', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -412,6 +424,7 @@ class YahooMailMCPServer {
                     {
                         name: 'reply_email',
                         description: 'Reply to an email by UID via Yahoo SMTP. Sets In-Reply-To/References headers for threading, adds a "Re:" subject prefix, and quotes the original message. Get UIDs from list_emails or search_emails.',
+                        annotations: { title: 'Reply to Email', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -449,6 +462,7 @@ class YahooMailMCPServer {
                     {
                         name: 'get_attachments',
                         description: 'List attachments of an email by UID (filename, contentType, size, index). Pass index or filename to download one attachment as base64 (max 10 MB).',
+                        annotations: { title: 'Get Attachments', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -481,6 +495,7 @@ class YahooMailMCPServer {
                     {
                         name: 'get_mailbox_stats',
                         description: 'Get message counts for a folder (total, unread, recent) using a lightweight IMAP STATUS command',
+                        annotations: { title: 'Get Mailbox Stats', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
