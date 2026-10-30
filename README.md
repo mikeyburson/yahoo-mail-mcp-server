@@ -7,7 +7,7 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
 - **Secure OAuth 2.0 Authentication**: Protect your remote MCP server with OAuth 2.0 authorization code flow with PKCE
 - **UID-Based Operations**: Uses permanent IMAP UIDs that don't change when emails are deleted (v3.0.0+)
 - **Full Email Management**: Complete email operations with batch processing support
-- **Fifteen Powerful Tools**:
+- **Seventeen Powerful Tools**:
   - `list_emails`: List recent emails with enriched metadata (size, flags, attachments) and pagination
   - `read_email`: Read the full content of emails (batch support)
   - `search_emails`: Advanced search with filters (date ranges, sender, unread status)
@@ -21,6 +21,8 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
   - `move_emails`: Move emails to any folder
   - `send_email`: Send a new email via Yahoo SMTP
   - `reply_email`: Reply (or reply all) to an email with proper threading headers
+  - `save_draft`: Save a new email or threaded reply to Drafts for human review (nothing is sent)
+  - `get_thread`: Get an email's conversation thread across its folder, INBOX and Sent
   - `get_attachments`: List an email's attachments and download one as base64
   - `get_mailbox_stats`: Get total/unread counts for a folder
 - **Enriched Metadata**: All emails include UID, size, flags, hasAttachments, and folder information
@@ -1014,6 +1016,48 @@ Reply to an email by UID. Sets `In-Reply-To`/`References` for threading, adds a 
 ```javascript
 reply_email({ uid: 510867, text: "Thanks, sounds good!" })
 reply_email({ uid: 510867, text: "Looping everyone in.", replyAll: true })
+```
+
+### save_draft
+
+Save an email to the account's Drafts folder without sending it, so a person can review, edit and send it from Yahoo Mail. The message is built locally (nodemailer `MailComposer`) and stored with IMAP `APPEND` and the `\Draft` flag. The Drafts folder is found by its `\Drafts` special-use attribute (falling back to a folder named `Draft`, then `Drafts`; Yahoo's is `Draft`). Bcc recipients are kept in the draft.
+
+With `in_reply_to_uid`, the draft is a threaded reply built exactly like `reply_email`: `In-Reply-To`/`References` headers, a `Re:` subject, the original quoted below your text, and recipients defaulting to the sender. Explicit `to`/`cc`/`subject` override those defaults.
+
+**Parameters:**
+- `to`: Array of recipient addresses (required unless `in_reply_to_uid` is given)
+- `cc`, `bcc` (optional): Arrays of addresses
+- `subject`: Subject line (required unless `in_reply_to_uid` is given)
+- `text` (required): Plain text body
+- `html` (optional): HTML body
+- `in_reply_to_uid` (optional): UID of the email to reply to
+- `folder` (optional): Folder containing `in_reply_to_uid` (default: 'INBOX')
+- `replyAll` (optional): For reply drafts without `cc`, CC all original To/CC recipients except yourself (default: false)
+- `account` (optional): 1 (default) or 2
+
+**Response:** JSON with the Drafts `folder`, the draft's `uid` (when the server reports it), `messageId`, recipients, `subject`, and for replies `inReplyTo`/`references`
+
+**Examples:**
+```javascript
+save_draft({ to: ["boss@company.com"], subject: "Weekly report", text: "Draft for review..." })
+save_draft({ in_reply_to_uid: 510867, text: "Thanks, sounds good!" })
+```
+
+### get_thread
+
+Get the conversation an email belongs to. Reads its `Message-ID`/`References`/`In-Reply-To` headers, then uses IMAP `HEADER` searches in its own folder, INBOX and the Sent folder (found by the `\Sent` special-use attribute, else `Sent`) for messages whose Message-ID is in the chain or whose `References`/`In-Reply-To` mention the thread root. Messages are de-duplicated by Message-ID.
+
+**Parameters:**
+- `uid` (required): UID of any email in the thread
+- `folder` (optional): Folder containing the email (default: 'INBOX')
+- `account` (optional): 1 (default) or 2
+
+**Response:** JSON with `rootMessageId`, `foldersSearched`, `truncated`, and up to 50 `messages` (oldest first, the most recent 50 if there are more), each `{ uid, folder, from, to, date, subject, snippet }` where `snippet` is the first 500 characters of the text body
+
+**Example:**
+```javascript
+get_thread({ uid: 510867 })
+get_thread({ uid: 1234, folder: "Sent" })
 ```
 
 ### get_attachments

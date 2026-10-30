@@ -37,6 +37,8 @@ export const EXPECTED_TOOLS = [
     'list_folders',
     'send_email',
     'reply_email',
+    'save_draft',
+    'get_thread',
     'get_attachments',
     'get_mailbox_stats'
 ];

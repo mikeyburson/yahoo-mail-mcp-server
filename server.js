@@ -17,6 +17,7 @@ import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import addressparser from 'nodemailer/lib/addressparser';
+import MailComposer from 'nodemailer/lib/mail-composer';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -27,6 +28,11 @@ dotenv.config({ quiet: true });
 
 // Maximum attachment size returned (base64-encoded) by get_attachments
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+// get_thread limits: messages returned, snippet length, and Message-IDs searched for
+const MAX_THREAD_MESSAGES = 50;
+const THREAD_SNIPPET_LENGTH = 500;
+const MAX_THREAD_SEARCH_IDS = 20;
 
 class YahooMailMCPServer {
     constructor() {
@@ -461,6 +467,88 @@ class YahooMailMCPServer {
                         }
                     },
                     {
+                        name: 'save_draft',
+                        description: 'Save an email to the account\'s Drafts folder (IMAP APPEND with the \\Draft flag) WITHOUT sending it, so a person can review, edit and send it from Yahoo Mail. Pass in_reply_to_uid to make a threaded reply draft: In-Reply-To/References are set, the subject gets a "Re:" prefix, the original is quoted, and recipients default to the sender (like reply_email). Returns the Drafts folder name.',
+                        annotations: { title: 'Save Draft', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'Recipient email addresses (e.g., ["alice@example.com", "Bob <bob@example.com>"]). Required unless in_reply_to_uid is given, in which case it defaults to the reply recipients.'
+                                },
+                                cc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'CC recipient email addresses (optional)'
+                                },
+                                bcc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'BCC recipient email addresses (optional; kept in the draft so they survive review)'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject line. Required unless in_reply_to_uid is given, in which case it defaults to "Re: <original subject>".'
+                                },
+                                text: {
+                                    type: 'string',
+                                    description: 'Plain text body of the draft (for reply drafts, the quoted original is appended automatically)'
+                                },
+                                html: {
+                                    type: 'string',
+                                    description: 'Optional HTML body. When provided, the draft is multipart with both text and HTML versions.'
+                                },
+                                in_reply_to_uid: {
+                                    type: 'number',
+                                    description: 'Optional UID of an email to reply to, making this a threaded reply draft. Get UIDs from list_emails or search_emails.'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the in_reply_to_uid email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                replyAll: {
+                                    type: 'boolean',
+                                    description: 'Reply drafts only, when cc is not given: CC all original To/CC recipients except yourself (default: false)',
+                                    default: false
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['text']
+                        }
+                    },
+                    {
+                        name: 'get_thread',
+                        description: 'Get the conversation thread of an email by UID. Follows its Message-ID/References/In-Reply-To headers and searches its folder, INBOX and Sent for the other messages; returns up to 50 messages oldest first with uid, folder, from, to, date, subject and a 500-character snippet.',
+                        annotations: { title: 'Get Thread', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of any email in the thread'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['uid']
+                        }
+                    },
+                    {
                         name: 'get_attachments',
                         description: 'List attachments of an email by UID (filename, contentType, size, index). Pass index or filename to download one attachment as base64 (max 10 MB).',
                         annotations: { title: 'Get Attachments', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -579,6 +667,24 @@ class YahooMailMCPServer {
                             text: args?.text,
                             html: args?.html,
                             replyAll: args?.replyAll ?? args?.reply_all ?? false
+                        }, account);
+
+                    case 'save_draft':
+                        return await this.saveDraft({
+                            to: args?.to,
+                            cc: args?.cc,
+                            bcc: args?.bcc,
+                            subject: args?.subject,
+                            text: args?.text,
+                            html: args?.html,
+                            inReplyToUid: args?.in_reply_to_uid ?? args?.inReplyToUid,
+                            folder: args?.folder || 'INBOX',
+                            replyAll: args?.replyAll ?? args?.reply_all ?? false
+                        }, account);
+
+                    case 'get_thread':
+                        return await this.getThread(args?.uid, {
+                            folder: args?.folder || 'INBOX'
                         }, account);
 
                     case 'get_attachments':
@@ -2090,6 +2196,577 @@ class YahooMailMCPServer {
         };
     }
 
+    /**
+     * Helper: Promise wrappers for the node-imap calls used by save_draft and get_thread,
+     * so one connection can run several commands in sequence. The caller owns imap.end().
+     */
+    promisifyImap(imap) {
+        return {
+            openBox: (folder, readOnly = true) => new Promise((resolve, reject) => {
+                imap.openBox(folder, readOnly, (err, box) => {
+                    if (err) {
+                        reject(new Error(`Failed to open folder "${folder}": ${err.message}`));
+                        return;
+                    }
+                    resolve(box);
+                });
+            }),
+
+            // CRITICAL: imap.search() returns UIDs by default (NOT sequence numbers)
+            search: (criteria) => new Promise((resolve, reject) => {
+                imap.search(criteria, (err, results) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve(results || []);
+                });
+            }),
+
+            // UID-based fetch; resolves with [{ raw: Buffer, attrs }] (raw Buffers keep 8-bit content intact)
+            fetch: (uids, options) => new Promise((resolve, reject) => {
+                const messages = [];
+                const fetch = imap.fetch(uids.join(','), options);
+
+                fetch.on('message', (msg) => {
+                    const chunks = [];
+                    let attrs = null;
+
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => {
+                            chunks.push(chunk);
+                        });
+                    });
+
+                    msg.once('attributes', (attributes) => {
+                        attrs = attributes;
+                    });
+
+                    msg.once('end', () => {
+                        messages.push({ raw: Buffer.concat(chunks), attrs: attrs });
+                    });
+                });
+
+                fetch.once('error', reject);
+                fetch.once('end', () => resolve(messages));
+            }),
+
+            getBoxes: () => new Promise((resolve, reject) => {
+                imap.getBoxes((err, boxes) => {
+                    if (err) {
+                        reject(new Error(`Failed to retrieve folders: ${err.message}`));
+                        return;
+                    }
+                    resolve(boxes || {});
+                });
+            }),
+
+            // Resolves with the appended message's UID when the server reports APPENDUID (UIDPLUS), else null
+            append: (raw, options) => new Promise((resolve, reject) => {
+                imap.append(raw, options, (err, uid) => {
+                    if (err) {
+                        reject(new Error(`Failed to save message to folder "${options.mailbox}": ${err.message}`));
+                        return;
+                    }
+                    resolve(uid ?? null);
+                });
+            })
+        };
+    }
+
+    /**
+     * Helper: Find a folder by RFC 6154 special-use attribute (e.g. '\\Drafts', '\\Sent') in a
+     * getBoxes() tree, falling back to the first existing folder named like one of fallbackNames
+     * (case-insensitive). \\Noselect folders are skipped.
+     * @returns {string|null} Full folder name, or null if none matches
+     */
+    findSpecialUseFolder(boxes, specialUse, fallbackNames = []) {
+        const folders = [];
+        const walk = (tree, parent) => {
+            for (const [name, box] of Object.entries(tree || {})) {
+                const fullName = parent ? `${parent}${box.delimiter || '/'}${name}` : name;
+                const attribs = [...(box.attribs || []), box.special_use_attrib]
+                    .filter(Boolean)
+                    .map(a => String(a).toLowerCase());
+
+                if (!attribs.includes('\\noselect')) {
+                    folders.push({ name: fullName, attribs: attribs });
+                }
+                if (box.children) {
+                    walk(box.children, fullName);
+                }
+            }
+        };
+        walk(boxes, null);
+
+        const wanted = specialUse.toLowerCase();
+        const bySpecialUse = folders.find(f => f.attribs.includes(wanted));
+        if (bySpecialUse) {
+            return bySpecialUse.name;
+        }
+
+        for (const fallback of fallbackNames) {
+            const byName = folders.find(f => f.name === fallback) ||
+                folders.find(f => f.name.toLowerCase() === fallback.toLowerCase());
+            if (byName) {
+                return byName.name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Helper: Build the reply fields (recipients, "Re:" subject, threading headers, quoted body)
+     * for a parsed original message. Mirrors replyEmail's logic so reply drafts match sent replies.
+     * @param {object} original - simpleParser result for the message being replied to
+     * @param {string} ownAddress - this account's address (lowercase), excluded from reply-all
+     */
+    buildReplyFields(original, ownAddress, options = {}) {
+        const { text, html, replyAll = false, uid } = options;
+
+        const fromList = this.flattenParsedAddresses(original.from);
+        const replyToList = this.flattenParsedAddresses(original.replyTo);
+        const toList = this.flattenParsedAddresses(original.to);
+        const ccList = this.flattenParsedAddresses(original.cc);
+
+        // Replying to our own message (e.g., from Sent) goes back to its original recipients
+        const sentByMe = fromList.some(a => a.address.toLowerCase() === ownAddress);
+        let primaryRecipients;
+        if (sentByMe && toList.length > 0) {
+            primaryRecipients = toList;
+        } else if (replyToList.length > 0) {
+            primaryRecipients = replyToList;
+        } else {
+            primaryRecipients = fromList;
+        }
+
+        const replyTo = this.dedupeAddresses(primaryRecipients);
+        if (replyTo.length === 0) {
+            throw new Error(`Email UID ${uid} has no sender address to reply to`);
+        }
+
+        // Reply-all: everyone on the original To/CC, minus ourselves and the primary recipients
+        const replyCc = replyAll
+            ? this.dedupeAddresses([...toList, ...ccList], [ownAddress, ...replyTo.map(a => a.address)])
+            : [];
+
+        // Subject: add "Re:" unless already present (avoid "Re: Re:")
+        const originalSubject = (original.subject || '').replace(/[\r\n]+/g, ' ').trim();
+        const replySubject = /^re\s*(\[\d+\])?\s*:/i.test(originalSubject)
+            ? originalSubject
+            : `Re: ${originalSubject}`.trim();
+
+        // Threading headers (RFC 5322 section 3.6.4)
+        const originalMessageId = original.messageId || null;
+        let references = [];
+        if (original.references) {
+            references = Array.isArray(original.references)
+                ? [...original.references]
+                : String(original.references).split(/\s+/);
+        } else if (original.inReplyTo) {
+            references = [original.inReplyTo];
+        }
+        references = references.filter(Boolean);
+        if (originalMessageId && !references.includes(originalMessageId)) {
+            references.push(originalMessageId);
+        }
+
+        // Quote the original message
+        const originalDate = original.date instanceof Date && !isNaN(original.date)
+            ? original.date.toUTCString()
+            : 'an earlier date';
+        const attribution = `On ${originalDate}, ${original.from?.text || 'the sender'} wrote:`;
+        const originalText = (original.text || '').replace(/\r\n?/g, '\n').trimEnd();
+        const quotedText = originalText
+            .split('\n')
+            .map(line => (line ? `> ${line}` : '>'))
+            .join('\n');
+
+        const replyText = `${text}\n\n${attribution}\n${quotedText}`;
+
+        let replyHtml;
+        if (html) {
+            replyHtml = `${html}\n<br><br>\n<div>${this.escapeHtml(attribution)}</div>\n` +
+                `<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex">\n` +
+                `${this.escapeHtml(originalText).replace(/\n/g, '<br>\n')}\n` +
+                `</blockquote>`;
+        }
+
+        return {
+            to: replyTo,
+            cc: replyCc,
+            subject: replySubject,
+            text: replyText,
+            html: replyHtml,
+            inReplyTo: originalMessageId,
+            references: references
+        };
+    }
+
+    /**
+     * Helper: Compose an RFC 5322 message with nodemailer's MailComposer (no SMTP involved)
+     * @returns {Promise<{raw: Buffer, messageId: string}>}
+     */
+    async buildDraftMime(mail) {
+        const message = new MailComposer({
+            ...mail,
+            // Message content comes from tool arguments: never let it pull in local files or URLs
+            disableFileAccess: true,
+            disableUrlAccess: true
+        }).compile();
+
+        // Unlike a sent message, a draft keeps its Bcc header so the recipients survive review
+        message.keepBcc = true;
+
+        const raw = await message.build();
+        return { raw, messageId: message.messageId() };
+    }
+
+    /**
+     * Save a draft (optionally a threaded reply) to the account's Drafts folder via IMAP APPEND.
+     * Nothing is sent.
+     */
+    async saveDraft(message, account = 1) {
+        const {
+            subject,
+            text,
+            html,
+            inReplyToUid,
+            folder = 'INBOX',
+            replyAll = false
+        } = message;
+
+        const isReply = inReplyToUid !== undefined && inReplyToUid !== null;
+        const to = this.parseAddressList(message.to, 'to');
+        const cc = this.parseAddressList(message.cc, 'cc');
+        const bcc = this.parseAddressList(message.bcc, 'bcc');
+        const hasSubject = typeof subject === 'string' && (subject.length > 0 || !isReply);
+
+        // Validate input
+        let validationError = to.error || cc.error || bcc.error;
+        if (!validationError && isReply) {
+            const uidError = this.validateUID(inReplyToUid);
+            if (uidError) {
+                validationError = uidError.replace(/^uid\b/, 'in_reply_to_uid');
+            }
+        }
+        if (!validationError && !isReply && to.addresses.length === 0) {
+            validationError = 'to must contain at least one recipient (or pass in_reply_to_uid to draft a reply)';
+        }
+        if (!validationError && subject !== undefined && subject !== null && typeof subject !== 'string') {
+            validationError = 'subject must be a string';
+        }
+        if (!validationError && !isReply && !hasSubject) {
+            validationError = 'subject is required';
+        }
+        if (!validationError && typeof text !== 'string') {
+            validationError = 'text is required';
+        }
+        if (!validationError && html !== undefined && html !== null && typeof html !== 'string') {
+            validationError = 'html must be a string';
+        }
+
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection(account);
+        const client = this.promisifyImap(imap);
+
+        try {
+            const { email } = this.getAccountCredentials(account);
+
+            let reply = null;
+            if (isReply) {
+                await client.openBox(folder, true);  // true = read-only mode
+                const [original] = await client.fetch([inReplyToUid], { bodies: '' });
+                if (!original) {
+                    throw new Error(
+                        `UID not found: ${inReplyToUid}. ` +
+                        `It may have been deleted or moved to another folder than "${folder}".`
+                    );
+                }
+                reply = this.buildReplyFields(await simpleParser(original.raw), email.toLowerCase(), {
+                    text, html, replyAll, uid: inReplyToUid
+                });
+            }
+
+            // Explicit to/cc/subject override the reply defaults
+            const draftTo = to.addresses.length > 0 ? to.addresses : reply.to;
+            const draftCc = cc.addresses.length > 0 ? cc.addresses : (reply ? reply.cc : []);
+            const draftSubject = hasSubject ? subject.replace(/[\r\n]+/g, ' ') : reply.subject;
+
+            const mail = {
+                from: email,
+                to: draftTo,
+                cc: draftCc.length > 0 ? draftCc : undefined,
+                bcc: bcc.addresses.length > 0 ? bcc.addresses : undefined,
+                subject: draftSubject,
+                text: reply ? reply.text : text,
+                html: (reply ? reply.html : html) || undefined
+            };
+            if (reply?.inReplyTo) {
+                mail.inReplyTo = reply.inReplyTo;
+            }
+            if (reply?.references.length > 0) {
+                mail.references = reply.references;
+            }
+
+            const { raw, messageId } = await this.buildDraftMime(mail);
+
+            // Yahoo marks its drafts folder "Draft" with the \Drafts special-use attribute
+            const boxes = await client.getBoxes();
+            const draftsFolder = this.findSpecialUseFolder(boxes, '\\Drafts', ['Draft', 'Drafts']);
+            if (!draftsFolder) {
+                throw new Error('No Drafts folder found (no folder has the \\Drafts attribute or is named "Draft"/"Drafts"). Use list_folders to check.');
+            }
+
+            const draftUid = await client.append(raw, { mailbox: draftsFolder, flags: ['\\Draft', '\\Seen'] });
+
+            const result = {
+                success: true,
+                sent: false,
+                folder: draftsFolder,
+                uid: draftUid,
+                messageId: messageId,
+                from: email,
+                to: this.formatAddresses(draftTo),
+                cc: this.formatAddresses(draftCc),
+                bcc: this.formatAddresses(bcc.addresses),
+                subject: draftSubject,
+                account: account,
+                note: `Draft saved to "${draftsFolder}" only; nothing was sent. Review and send it from Yahoo Mail.`
+            };
+            if (reply) {
+                result.inReplyToUid = inReplyToUid;
+                result.sourceFolder = folder;
+                result.inReplyTo = reply.inReplyTo;
+                result.references = reply.references;
+                if (!reply.inReplyTo) {
+                    result.warning = 'Original email has no Message-ID header; the reply may not thread in mail clients.';
+                }
+            }
+
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(result, null, 2)
+                }]
+            };
+        } finally {
+            imap.end();
+        }
+    }
+
+    /**
+     * Helper: Extract threading Message-IDs from parsed headers (Imap.parseHeader output:
+     * lowercase keys, array values). The root is the first References entry, else In-Reply-To,
+     * else the message's own Message-ID. chain is capped at MAX_THREAD_SEARCH_IDS, keeping the root.
+     */
+    extractThreadIds(headers = {}) {
+        const idsOf = (field) => {
+            const value = [].concat(headers?.[field] || []).join(' ');
+            return value.match(/<[^<>\s]+>/g) || value.split(/\s+/).filter(Boolean);
+        };
+
+        const messageId = idsOf('message-id')[0] || null;
+        const inReplyTo = idsOf('in-reply-to')[0] || null;
+        const references = idsOf('references');
+        const rootId = references[0] || inReplyTo || messageId;
+
+        let chain = [...new Set([...references, inReplyTo, messageId].filter(Boolean))];
+        if (chain.length > MAX_THREAD_SEARCH_IDS) {
+            chain = [chain[0], ...chain.slice(-(MAX_THREAD_SEARCH_IDS - 1))];
+        }
+
+        return { messageId, inReplyTo, references, rootId, chain };
+    }
+
+    /**
+     * Helper: node-imap search criterion matching a thread: any Message-ID in the chain, or
+     * References/In-Reply-To containing the root (or the message itself). Terms are combined
+     * into a balanced OR tree to keep nesting shallow.
+     * @returns {Array|null} A single criterion (pass it as [criterion]), or null if there are no IDs
+     */
+    buildThreadSearchCriteria(threadIds) {
+        const { chain = [], rootId = null, messageId = null } = threadIds || {};
+
+        const terms = chain.map(id => ['HEADER', 'MESSAGE-ID', id]);
+        for (const id of new Set([rootId, messageId].filter(Boolean))) {
+            terms.push(['HEADER', 'REFERENCES', id]);
+            terms.push(['HEADER', 'IN-REPLY-TO', id]);
+        }
+
+        if (terms.length === 0) {
+            return null;
+        }
+
+        const combine = (list) => {
+            if (list.length === 1) {
+                return list[0];
+            }
+            const mid = Math.ceil(list.length / 2);
+            return ['OR', combine(list.slice(0, mid)), combine(list.slice(mid))];
+        };
+
+        return combine(terms);
+    }
+
+    /**
+     * Get the thread an email belongs to, searching its folder, INBOX and Sent
+     */
+    async getThread(uid, options = {}, account = 1) {
+        const { folder = 'INBOX' } = options;
+
+        // Validate input
+        const validationError = this.validateUID(uid);
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection(account);
+        const client = this.promisifyImap(imap);
+
+        try {
+            // 1. Threading headers of the requested email
+            await client.openBox(folder, true);  // true = read-only mode
+            const [target] = await client.fetch([uid], {
+                bodies: 'HEADER.FIELDS (MESSAGE-ID REFERENCES IN-REPLY-TO)'
+            });
+            if (!target) {
+                throw new Error(
+                    `UID not found: ${uid}. ` +
+                    `It may have been deleted or moved to another folder than "${folder}".`
+                );
+            }
+
+            const threadIds = this.extractThreadIds(Imap.parseHeader(target.raw.toString('utf8')));
+            const criteria = this.buildThreadSearchCriteria(threadIds);
+            const warnings = [];
+
+            // 2. Folders to search: the email's own folder first, then INBOX and Sent
+            const folders = [folder];
+            const isInbox = (name) => name.toUpperCase() === 'INBOX';
+            if (criteria) {
+                const sentFolder = this.findSpecialUseFolder(await client.getBoxes(), '\\Sent', ['Sent']);
+                if (!sentFolder) {
+                    warnings.push('No Sent folder found (no folder has the \\Sent attribute or is named "Sent"); your replies may be missing.');
+                }
+                for (const candidate of ['INBOX', sentFolder]) {
+                    if (candidate && !folders.some(f => f === candidate || (isInbox(f) && isInbox(candidate)))) {
+                        folders.push(candidate);
+                    }
+                }
+            } else {
+                warnings.push('Email has no Message-ID, References or In-Reply-To header; only the email itself is returned.');
+            }
+
+            // 3. Search and fetch each folder, de-duplicating by Message-ID
+            const seen = new Set();
+            const found = [];
+            const searched = [];
+            let truncated = false;
+
+            for (const current of folders) {
+                if (current !== folder) {
+                    try {
+                        await client.openBox(current, true);
+                    } catch (err) {
+                        warnings.push(err.message);
+                        continue;
+                    }
+                }
+                searched.push(current);
+
+                let uids = [];
+                if (criteria) {
+                    try {
+                        uids = await client.search([criteria]);
+                    } catch (err) {
+                        warnings.push(`Search failed in folder "${current}": ${err.message}`);
+                    }
+                }
+                if (current === folder && !uids.includes(uid)) {
+                    uids.push(uid);  // always include the requested email itself
+                }
+                uids = [...new Set(uids)].sort((a, b) => a - b);
+                if (uids.length > MAX_THREAD_MESSAGES) {
+                    truncated = true;
+                    uids = uids.slice(-MAX_THREAD_MESSAGES);
+                }
+                if (uids.length === 0) {
+                    continue;
+                }
+
+                for (const { raw, attrs } of await client.fetch(uids, { bodies: '' })) {
+                    const parsed = await simpleParser(raw);
+                    const key = parsed.messageId || `${current}\u0000${attrs.uid}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+
+                    let date = parsed.date instanceof Date && !isNaN(parsed.date) ? parsed.date : null;
+                    if (!date && attrs.date instanceof Date && !isNaN(attrs.date)) {
+                        date = attrs.date;  // fall back to INTERNALDATE
+                    }
+
+                    found.push({
+                        time: date ? date.getTime() : 0,
+                        message: {
+                            uid: attrs.uid,
+                            folder: current,
+                            from: parsed.from?.text || 'Unknown',
+                            to: parsed.to?.text || 'Unknown',
+                            date: date ? date.toISOString() : 'Unknown Date',
+                            subject: parsed.subject || 'No Subject',
+                            snippet: (parsed.text || '').replace(/\s+/g, ' ').trim().slice(0, THREAD_SNIPPET_LENGTH)
+                        }
+                    });
+                }
+            }
+
+            // Oldest first; keep the most recent MAX_THREAD_MESSAGES
+            found.sort((a, b) => a.time - b.time || a.message.uid - b.message.uid);
+            if (found.length > MAX_THREAD_MESSAGES) {
+                truncated = true;
+            }
+            const messages = found.slice(-MAX_THREAD_MESSAGES).map(f => f.message);
+
+            const result = {
+                uid: uid,
+                folder: folder,
+                messageId: threadIds.messageId,
+                rootMessageId: threadIds.rootId,
+                foldersSearched: searched,
+                count: messages.length,
+                truncated: truncated,
+                messages: messages
+            };
+            if (warnings.length > 0) {
+                result.warnings = warnings;
+            }
+
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(result, null, 2)
+                }]
+            };
+        } finally {
+            imap.end();
+        }
+    }
+
     setupErrorHandling() {
         this.server.onerror = (error) => {
             console.error('[MCP Error]', error);
@@ -2842,6 +3519,8 @@ class YahooMailMCPServer {
                     'list_folders',
                     'send_email',
                     'reply_email',
+                    'save_draft',
+                    'get_thread',
                     'get_attachments',
                     'get_mailbox_stats'
                 ]
