@@ -304,9 +304,11 @@ git push -u origin main
    | `YAHOO_APP_PASSWORD` | `your16charpassword` | See "Get Yahoo Mail App Password" section |
    | `OAUTH_CLIENT_ID` | `32-char-hex-string` | Run: `openssl rand -hex 16` |
    | `OAUTH_CLIENT_SECRET` | `64-char-hex-string` | Run: `openssl rand -hex 32` |
+   | `OAUTH_APPROVAL_PASSWORD` | `strong-password` | Recommended. Run: `openssl rand -base64 24` |
+   | `TRUST_PROXY` | `1` | Render sits behind a proxy; needed for per-IP rate limits |
 
    **Important**:
-   - Mark `YAHOO_EMAIL`, `YAHOO_APP_PASSWORD`, `OAUTH_CLIENT_ID`, and `OAUTH_CLIENT_SECRET` as "Secret"
+   - Mark `YAHOO_EMAIL`, `YAHOO_APP_PASSWORD`, `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, and `OAUTH_APPROVAL_PASSWORD` as "Secret"
    - `PORT` is automatically set by Render, don't add it manually
    - Save the OAuth credentials - you'll need them to configure Claude Desktop
 
@@ -481,6 +483,11 @@ docker ps
 | `YAHOO_APP_PASSWORD` | Yes | - | 16-character app-specific password from Yahoo |
 | `OAUTH_CLIENT_ID` | Yes (Remote) | - | OAuth 2.0 client ID for MCP server authentication (generate with `openssl rand -hex 16`) |
 | `OAUTH_CLIENT_SECRET` | Yes (Remote) | - | OAuth 2.0 client secret for MCP server authentication (generate with `openssl rand -hex 32`) |
+| `OAUTH_APPROVAL_PASSWORD` | Recommended (Remote) | - | Owner password entered on a consent page at `/oauth/authorize` before an authorization code is issued. Unset = auto-approve (a startup warning is logged) |
+| `TRUST_PROXY` | No | unset | Express `trust proxy` setting. Set `1` on Render so rate limits use the client IP from `X-Forwarded-For`; leave unset when clients connect directly |
+| `RATE_LIMIT_OAUTH_PER_MIN` | No | `10` | Per-IP limit for `GET`/`POST /oauth/authorize` and `POST /oauth/token` (each counted separately; `0` disables) |
+| `RATE_LIMIT_MCP_PER_MIN` | No | `120` | Per-IP limit across `/mcp`, `/mcp/sse` and `/mcp/message` (`0` disables) |
+| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Rate-limit window length in milliseconds |
 | `TRANSPORT_MODE` | No | `stdio` | Transport mode: `stdio` or `sse` |
 | `PORT` | No | `3000` | Port for SSE mode (auto-set by Render) |
 | `NODE_ENV` | No | `development` | Environment: `development` or `production` |
@@ -528,6 +535,8 @@ yahoo-mail-mcp-server/
    - Only clients with correct credentials can access your emails
    - Generate strong random credentials: `openssl rand -hex 16` and `openssl rand -hex 32`
    - Store credentials securely in Render dashboard (marked as "Secret")
+   - Set `OAUTH_APPROVAL_PASSWORD` so new authorizations need your approval on a consent page (the client ID alone is not a secret)
+   - Per-IP rate limiting on OAuth and MCP endpoints (set `TRUST_PROXY=1` behind Render's proxy)
 
 2. **Never commit credentials**
    - `.env` file is gitignored
