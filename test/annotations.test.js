@@ -13,10 +13,11 @@ import { EXPECTED_TOOLS } from './helpers/server.js';
 
 const HINTS = ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint'];
 
-const READ_ONLY = ['list_emails', 'read_email', 'search_emails', 'list_folders', 'get_attachments', 'get_mailbox_stats'];
+const READ_ONLY = ['list_emails', 'read_email', 'search_emails', 'list_folders', 'get_attachments', 'get_mailbox_stats', 'get_thread'];
 const DESTRUCTIVE = ['delete_emails', 'archive_emails', 'move_emails'];
 const FLAG_CHANGES = ['mark_as_read', 'mark_as_unread', 'flag_emails', 'unflag_emails'];
 const SENDS = ['send_email', 'reply_email'];
+const DRAFTS = ['save_draft'];
 
 const mcp = new YahooMailMCPServer();
 const byName = (tools) => Object.fromEntries(tools.map((t) => [t.name, t]));
@@ -26,7 +27,7 @@ function assertAnnotations(tools) {
 
     // The categories above cover every tool exactly once.
     assert.deepEqual(
-        [...READ_ONLY, ...DESTRUCTIVE, ...FLAG_CHANGES, ...SENDS].sort(),
+        [...READ_ONLY, ...DESTRUCTIVE, ...FLAG_CHANGES, ...SENDS, ...DRAFTS].sort(),
         [...EXPECTED_TOOLS].sort()
     );
 
@@ -68,6 +69,16 @@ function assertAnnotations(tools) {
         assert.equal(a.destructiveHint, false, `${name}: destructiveHint`);
         assert.equal(a.idempotentHint, false, `${name}: idempotentHint`);
         assert.equal(a.openWorldHint, true, `${name}: openWorldHint`);
+    }
+
+    // Saving a draft writes to the mailbox (a new message per call) but sends nothing,
+    // so it is neither destructive nor open-world.
+    for (const name of DRAFTS) {
+        const a = tool[name].annotations;
+        assert.equal(a.readOnlyHint, false, `${name}: readOnlyHint`);
+        assert.equal(a.destructiveHint, false, `${name}: destructiveHint`);
+        assert.equal(a.idempotentHint, false, `${name}: idempotentHint`);
+        assert.equal(a.openWorldHint, false, `${name}: openWorldHint`);
     }
 
     // Only the send tools are open-world.

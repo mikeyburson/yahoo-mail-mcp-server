@@ -9,7 +9,7 @@ It runs two ways:
 
 ## Tools
 
-The server exposes 15 tools. Emails are identified by IMAP **UIDs**, which stay the same when other messages are deleted. Get UIDs from `list_emails` or `search_emails`, then pass them to the other tools.
+The server exposes 17 tools. Emails are identified by IMAP **UIDs**, which stay the same when other messages are deleted. Get UIDs from `list_emails` or `search_emails`, then pass them to the other tools.
 
 | Tool | What it does | Main parameters | Annotation |
 |------|--------------|-----------------|------------|
@@ -18,12 +18,14 @@ The server exposes 15 tools. Emails are identified by IMAP **UIDs**, which stay 
 | `search_emails` | Searches subject or sender, with optional filters | `query`, `sender`, `dateFrom`, `dateTo`, `unreadOnly`, `count`, `folder` | read-only |
 | `list_folders` | Lists every IMAP folder (name, delimiter, flags, selectable) | none | read-only |
 | `get_mailbox_stats` | Returns total, unread and recent counts plus `uidNext`/`uidValidity` (uses IMAP STATUS) | `folder` | read-only |
+| `get_thread` | Returns an email's conversation (its folder, INBOX and Sent) sorted by date, with snippets (max 50) | `uid`, `folder` | read-only |
 | `get_attachments` | Lists an email's attachments. Pass `index` or `filename` to download one as base64 (10 MB max) | `uid`, `index`, `filename`, `folder` | read-only |
 | `mark_as_read` / `mark_as_unread` | Sets or clears `\Seen` | `uids[]`, `folder` | write, not destructive |
 | `flag_emails` / `unflag_emails` | Sets or clears `\Flagged` (star) | `uids[]`, `folder` | write, not destructive |
 | `delete_emails` | Moves emails to Trash (they can be recovered) | `uids[]`, `folder` | destructive |
 | `archive_emails` | Moves emails to Archive | `uids[]`, `folder` | destructive |
 | `move_emails` | Moves emails to any folder | `uids[]`, `folderName`, `sourceFolder` | destructive |
+| `save_draft` | Saves a new email or a threaded reply draft to Drafts for review. Nothing is sent | `to[]`, `subject`, `text`, `html`, `in_reply_to_uid`, `replyAll`, `folder` | write, not destructive |
 | `send_email` | Sends a new email through Yahoo SMTP | `to[]`, `subject`, `text`, `cc[]`, `bcc[]`, `html` | open-world |
 | `reply_email` | Replies, or replies to all, with `In-Reply-To`/`References` headers, a `Re:` prefix and the original quoted | `uid`, `text`, `html`, `replyAll`, `folder` | open-world |
 
@@ -221,7 +223,7 @@ MIT
 **Added**
 - Streamable HTTP transport at `/mcp` for Claude.ai custom connectors.
 - A second account through the `account` parameter (`YAHOO_EMAIL_2`, `YAHOO_APP_PASSWORD_2`).
-- New tools `send_email`, `reply_email`, `get_attachments` and `get_mailbox_stats`, for 15 tools in total.
+- New tools `send_email`, `reply_email`, `get_attachments`, `get_mailbox_stats`, `save_draft` and `get_thread`, for 17 tools in total.
 - MCP tool annotations (read-only, destructive and open-world hints) on every tool.
 - A `node:test` suite and a GitHub Actions workflow (Node 22 and 24).
 
