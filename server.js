@@ -1338,7 +1338,7 @@ class YahooMailMCPServer {
 
                 // UID STORE/MOVE return OK for UIDs that don't exist, so look them up first:
                 // missing UIDs are reported as failed and only existing ones are acted on
-                imap.search([['UID', uids.join(',')]], (err, found) => {
+                imap.search([['UID', ...uids]], (err, found) => {
                     if (err) {
                         imap.end();
                         reject(new Error(`Failed to look up UIDs in "${folder}": ${err.message}`));
@@ -2403,7 +2403,7 @@ class YahooMailMCPServer {
             // UID-based fetch; resolves with [{ raw: Buffer, attrs }] (raw Buffers keep 8-bit content intact)
             fetch: (uids, options) => new Promise((resolve, reject) => {
                 const messages = [];
-                const fetch = imap.fetch(uids.join(','), options);
+                const fetch = imap.fetch(uids, options);
 
                 fetch.on('message', (msg) => {
                     const chunks = [];

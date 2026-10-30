@@ -328,7 +328,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.deepEqual(res.emails.filter((e) => e.hasAttachments).map((e) => e.uid), [107]);
         });
 
-        it('reports each message size in bytes', { todo: TODO.size }, async () => {
+        it('reports each message size in bytes', async () => {
             const res = await mcp.callJson('list_emails');
             for (const email of res.emails) {
                 assert.equal(email.size, message(A1.user, 'INBOX', email.uid).raw.length, `size of UID ${email.uid}`);
@@ -341,7 +341,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.deepEqual(uidsOf(await mcp.callJson('list_emails', { count: 5, offset: 4 })), [102, 101]);
         });
 
-        it('returns nothing when offset is past the end', { todo: TODO.pastEnd }, async () => {
+        it('returns nothing when offset is past the end', async () => {
             for (const offset of [6, 10]) {
                 const res = await mcp.callJson('list_emails', { count: 3, offset });
                 assert.deepEqual(res.emails, [], `offset ${offset}`);
@@ -359,7 +359,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.equal(trash.totalCount, 0);
         });
 
-        it('decodes raw UTF-8 (8-bit) subject headers', { todo: TODO.ascii }, async () => {
+        it('decodes raw UTF-8 (8-bit) subject headers', async () => {
             const res = await mcp.callJson('list_emails', { folder: 'Bulk Mail' });
             assert.equal(res.emails[0].subject, SPAM_SUBJECT);
         });
@@ -370,7 +370,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
     });
 
     describe('read_email', () => {
-        it('reads one email with headers, flags and body', { todo: TODO.readRace }, async () => {
+        it('reads one email with headers, flags and body', async () => {
             const text = await mcp.call('read_email', { uids: [101] });
             assert.match(text, /Email UID: 101\b/);
             assert.match(text, /From: .*carol@example\.com/);
@@ -381,7 +381,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.match(text, /Revenue is up\./);
         });
 
-        it('reads several UIDs in one call, in UID order', { todo: `${TODO.multiUid}; ${TODO.readRace}` }, async () => {
+        it('reads several UIDs in one call, in UID order', async () => {
             const text = await mcp.call('read_email', { uids: [110, 101, 107] });
             assert.doesNotMatch(text, /^Error/);
             const order = [...text.matchAll(/Email UID: (\d+)/g)].map((m) => Number(m[1]));
@@ -392,19 +392,19 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.match(text, /Kickoff is moved to Monday\./);
         });
 
-        it('decodes an 8-bit UTF-8 body and encoded-word subject', { todo: `${TODO.ascii}; ${TODO.readRace}` }, async () => {
+        it('decodes an 8-bit UTF-8 body and encoded-word subject', async () => {
             const text = await mcp.call('read_email', { uids: [104] });
             assert.match(text, new RegExp(`Subject: ${GERMAN_SUBJECT}`));
             assert.ok(text.includes(UTF8_BODY), `body not decoded as UTF-8:\n${text}`);
         });
 
-        it('decodes raw UTF-8 headers and reads from other folders', { todo: `${TODO.ascii}; ${TODO.readRace}` }, async () => {
+        it('decodes raw UTF-8 headers and reads from other folders', async () => {
             const text = await mcp.call('read_email', { uids: [7], folder: 'Bulk Mail' });
             assert.ok(text.includes(`Subject: ${SPAM_SUBJECT}`), text);
             assert.match(text, /Sie haben gewonnen!/);
         });
 
-        it('falls back to the HTML part for HTML-only mail', { todo: TODO.readRace }, async () => {
+        it('falls back to the HTML part for HTML-only mail', async () => {
             const text = await mcp.call('read_email', { uids: [111] });
             assert.match(text, /Hello\s+(\*\*|<b>)?reader/i);
         });
@@ -445,7 +445,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.deepEqual(await search({ dateTo: '2024-03-02' }), [101]);
         });
 
-        it('rejects unparseable dates instead of ignoring them', { todo: TODO.badDate }, async () => {
+        it('rejects unparseable dates instead of ignoring them', async () => {
             assert.match(await mcp.call('search_emails', { dateFrom: 'not-a-date' }), /^Error: .*dateFrom/);
             assert.match(await mcp.call('search_emails', { dateTo: '2024-13-45' }), /^Error: .*dateTo/);
         });
@@ -513,7 +513,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.deepEqual(flagsOf(A1.user, 'INBOX', 102), [], 'INBOX untouched');
         });
 
-        it('does not report nonexistent UIDs as successful', { todo: TODO.missingUid }, async () => {
+        it('does not report nonexistent UIDs as successful', async () => {
             const mixed = await mcp.call('mark_as_read', { uids: [102, 9999] });
             assert.deepEqual(flagsOf(A1.user, 'INBOX', 102), ['\\Seen']);
             assert.doesNotMatch(mixed, /^Successfully marked as read 2 email/, 'must not claim both succeeded');
@@ -567,7 +567,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             assert.deepEqual(uidsIn(A1.user, 'INBOX'), [101, 102, 104, 107, 110, 111]);
         });
 
-        it('does not report nonexistent UIDs as deleted', { todo: TODO.missingUid }, async () => {
+        it('does not report nonexistent UIDs as deleted', async () => {
             const text = await mcp.call('delete_emails', { uids: [9999] });
             assert.doesNotMatch(text, /^Successfully/);
             assert.match(text, /9999/);
@@ -847,7 +847,7 @@ describe('integration: every tool against fake IMAP/SMTP servers', () => {
             onlyAccount2Logins();
         });
 
-        it('account "2" passed as a string selects account 2 (or is rejected), never account 1', { todo: TODO.accountString }, async () => {
+        it('account "2" passed as a string selects account 2 (or is rejected), never account 1', async () => {
             const text = await mcp.call('delete_emails', { uids: [101], account: '2' });
             account1Untouched();
             assert.ok(!imap.logins().includes(A1.user), 'must not log in to account 1');
