@@ -641,9 +641,9 @@ class YahooMailMCPServer {
             const imap = new Imap({
                 user: email,
                 password: password,
-                host: 'imap.mail.yahoo.com',
-                port: 993,
-                tls: true,
+                host: process.env.IMAP_HOST || 'imap.mail.yahoo.com',
+                port: Number(process.env.IMAP_PORT) || 993,
+                tls: process.env.IMAP_TLS !== 'false',
                 authTimeout: 30000,
                 connTimeout: 30000,
                 tlsOptions: {
@@ -1617,9 +1617,9 @@ class YahooMailMCPServer {
         const { email, password } = this.getAccountCredentials(account);
 
         const transporter = nodemailer.createTransport({
-            host: 'smtp.mail.yahoo.com',
-            port: 465,
-            secure: true,
+            host: process.env.SMTP_HOST || 'smtp.mail.yahoo.com',
+            port: Number(process.env.SMTP_PORT) || 465,
+            secure: process.env.SMTP_SECURE !== 'false',
             auth: {
                 user: email,
                 pass: password
