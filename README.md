@@ -7,7 +7,7 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
 - **Secure OAuth 2.0 Authentication**: Protect your remote MCP server with OAuth 2.0 authorization code flow with PKCE
 - **UID-Based Operations**: Uses permanent IMAP UIDs that don't change when emails are deleted (v3.0.0+)
 - **Full Email Management**: Complete email operations with batch processing support
-- **Eleven Powerful Tools**:
+- **Fifteen Powerful Tools**:
   - `list_emails`: List recent emails with enriched metadata (size, flags, attachments) and pagination
   - `read_email`: Read the full content of emails (batch support)
   - `search_emails`: Advanced search with filters (date ranges, sender, unread status)
@@ -19,6 +19,10 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
   - `flag_emails`: Flag emails as important/starred
   - `unflag_emails`: Remove flag from emails
   - `move_emails`: Move emails to any folder
+  - `send_email`: Send a new email via Yahoo SMTP
+  - `reply_email`: Reply (or reply all) to an email with proper threading headers
+  - `get_attachments`: List an email's attachments and download one as base64
+  - `get_mailbox_stats`: Get total/unread counts for a folder
 - **Enriched Metadata**: All emails include UID, size, flags, hasAttachments, and folder information
 - **Advanced Search**: Filter by date range, sender, unread status, and search across any folder
 - **Batch Operations**: All management operations support processing multiple emails at once with accurate success/failure tracking
@@ -33,7 +37,7 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
 
 ### For Local Development
 
-- **Node.js**: Version 18.0.0 or higher
+- **Node.js**: Version 20.0.0 or higher (required by nodemailer)
 - **Yahoo Mail Account**: With app-specific password enabled
 - **Git**: For version control
 
@@ -973,6 +977,78 @@ move_emails({ uids: [510867, 510866, 510862], folderName: "Personal" })
 
 // Move from Sent to Archive
 move_emails({ uids: [510867], folderName: "Archive", sourceFolder: "Sent" })
+```
+
+### send_email
+
+Send a new email immediately via Yahoo SMTP (`smtp.mail.yahoo.com:465`, TLS), using the same email address and app password as IMAP for the selected account. Yahoo normally saves SMTP-sent mail to the Sent folder automatically, so the server does not append a separate copy.
+
+**Parameters:**
+- `to` (required): Array of recipient addresses (e.g., `["alice@example.com", "Bob <bob@example.com>"]`)
+- `cc`, `bcc` (optional): Arrays of addresses
+- `subject` (required): Subject line
+- `text` (required): Plain text body
+- `html` (optional): HTML body (sent as multipart alongside `text`)
+- `account` (optional): 1 (default) or 2
+
+**Response:** JSON with `messageId`, recipients, and SMTP `accepted`/`rejected` lists
+
+**Example:**
+```javascript
+send_email({ to: ["boss@company.com"], subject: "Weekly report", text: "Attached below..." })
+```
+
+### reply_email
+
+Reply to an email by UID. Sets `In-Reply-To`/`References` for threading, adds a `Re:` prefix (never `Re: Re:`), and quotes the original message below your text. Reply goes to `Reply-To` if present, otherwise the sender (or, when replying to your own sent message, its original recipients).
+
+**Parameters:**
+- `uid` (required): UID of the email to reply to
+- `text` (required): Reply body (plain text)
+- `html` (optional): Reply body (HTML)
+- `replyAll` (optional): Also CC all original To/CC recipients, excluding yourself (default: false)
+- `folder` (optional): Folder containing the original (default: 'INBOX')
+- `account` (optional): 1 (default) or 2
+
+**Examples:**
+```javascript
+reply_email({ uid: 510867, text: "Thanks, sounds good!" })
+reply_email({ uid: 510867, text: "Looping everyone in.", replyAll: true })
+```
+
+### get_attachments
+
+List an email's attachments, or download one as base64. Downloads are limited to 10 MB per attachment.
+
+**Parameters:**
+- `uid` (required): UID of the email
+- `index` (optional): Zero-based attachment index (from the listing) to download
+- `filename` (optional): Attachment filename to download (used when `index` is not given)
+- `folder` (optional): Folder containing the email (default: 'INBOX')
+- `account` (optional): 1 (default) or 2
+
+**Response:** Without `index`/`filename`: JSON list of `{ index, filename, contentType, size, disposition, contentId }`. With one: the attachment metadata plus `contentBase64`.
+
+**Examples:**
+```javascript
+get_attachments({ uid: 510867 })               // list
+get_attachments({ uid: 510867, index: 0 })     // download first attachment
+get_attachments({ uid: 510867, filename: "invoice.pdf" })
+```
+
+### get_mailbox_stats
+
+Get message counts for a folder using a lightweight IMAP `STATUS` command (no messages are fetched).
+
+**Parameters:**
+- `folder` (optional): Folder name (default: 'INBOX')
+- `account` (optional): 1 (default) or 2
+
+**Response:** JSON with `totalMessages`, `unreadMessages`, `recentMessages`, `uidNext`, `uidValidity`
+
+**Example:**
+```javascript
+get_mailbox_stats({ folder: "INBOX" })
 ```
 
 ## Performance Considerations
