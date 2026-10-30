@@ -11,21 +11,37 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import crypto from 'crypto';
+import { realpathSync } from 'fs';
+import { fileURLToPath } from 'url';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
+import nodemailer from 'nodemailer';
+import addressparser from 'nodemailer/lib/addressparser';
+import MailComposer from 'nodemailer/lib/mail-composer';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file (for local development)
-dotenv.config();
+// quiet: dotenv 17 otherwise logs a banner to stdout, corrupting the stdio JSON-RPC stream
+dotenv.config({ quiet: true });
+
+// Maximum decoded attachment size get_attachments will return (checked before base64 encoding)
+const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+// Largest whole message fetchRawMessage will download (checked via RFC822.SIZE before the body)
+const MAX_RAW_MESSAGE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
+
+// get_thread limits: messages returned, snippet length, and Message-IDs searched for
+const MAX_THREAD_MESSAGES = 50;
+const THREAD_SNIPPET_LENGTH = 500;
+const MAX_THREAD_SEARCH_IDS = 20;
 
 class YahooMailMCPServer {
     constructor() {
         this.server = new Server(
             {
                 name: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '4.0.0',
             },
             {
                 capabilities: {
@@ -57,6 +73,7 @@ class YahooMailMCPServer {
                     {
                         name: 'list_emails',
                         description: 'List recent emails from a Yahoo Mail folder. Returns UIDs (permanent identifiers) and enriched metadata including size, flags, and attachment status.',
+                        annotations: { title: 'List Emails', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -86,6 +103,7 @@ class YahooMailMCPServer {
                     {
                         name: 'read_email',
                         description: 'Read email content using UIDs (permanent identifiers). UIDs don\'t change when emails are deleted. Get UIDs from list_emails or search_emails.',
+                        annotations: { title: 'Read Email', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -112,6 +130,7 @@ class YahooMailMCPServer {
                     {
                         name: 'search_emails',
                         description: 'Search emails using UIDs with advanced filters. Returns UIDs which are permanent identifiers that don\'t change when emails are deleted. Get UIDs from results for subsequent operations.',
+                        annotations: { title: 'Search Emails', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -162,6 +181,7 @@ class YahooMailMCPServer {
                     {
                         name: 'delete_emails',
                         description: 'Move emails to Trash folder using UIDs (soft delete, recoverable). UIDs are permanent identifiers.',
+                        annotations: { title: 'Delete Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -188,6 +208,7 @@ class YahooMailMCPServer {
                     {
                         name: 'archive_emails',
                         description: 'Move emails to Archive folder using UIDs for long-term storage. UIDs are permanent identifiers.',
+                        annotations: { title: 'Archive Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -214,6 +235,7 @@ class YahooMailMCPServer {
                     {
                         name: 'mark_as_read',
                         description: 'Mark emails as read using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Mark as Read', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -240,6 +262,7 @@ class YahooMailMCPServer {
                     {
                         name: 'mark_as_unread',
                         description: 'Mark emails as unread using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Mark as Unread', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -266,6 +289,7 @@ class YahooMailMCPServer {
                     {
                         name: 'flag_emails',
                         description: 'Flag emails as important/starred using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Flag Emails', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -292,6 +316,7 @@ class YahooMailMCPServer {
                     {
                         name: 'unflag_emails',
                         description: 'Remove flag/star from emails using UIDs. UIDs are permanent identifiers.',
+                        annotations: { title: 'Unflag Emails', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -318,6 +343,7 @@ class YahooMailMCPServer {
                     {
                         name: 'move_emails',
                         description: 'Move emails to a specified folder using UIDs. UIDs are permanent identifiers. Use list_folders to see available folders.',
+                        annotations: { title: 'Move Emails', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
@@ -348,9 +374,227 @@ class YahooMailMCPServer {
                     {
                         name: 'list_folders',
                         description: 'List all available IMAP folders/mailboxes in your Yahoo Mail account',
+                        annotations: { title: 'List Folders', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
                         inputSchema: {
                             type: 'object',
                             properties: {
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            }
+                        }
+                    },
+                    {
+                        name: 'send_email',
+                        description: 'Send a new email immediately via Yahoo SMTP from the selected account. Yahoo normally saves a copy of SMTP-sent mail to the Sent folder automatically.',
+                        annotations: { title: 'Send Email', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'Recipient email addresses (e.g., ["alice@example.com", "Bob <bob@example.com>"])',
+                                    minItems: 1
+                                },
+                                cc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'CC recipient email addresses (optional)'
+                                },
+                                bcc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'BCC recipient email addresses (optional)'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject line'
+                                },
+                                text: {
+                                    type: 'string',
+                                    description: 'Plain text body of the email'
+                                },
+                                html: {
+                                    type: 'string',
+                                    description: 'Optional HTML body. When provided, the email is sent as multipart with both text and HTML versions.'
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['to', 'subject', 'text']
+                        }
+                    },
+                    {
+                        name: 'reply_email',
+                        description: 'Reply to an email by UID via Yahoo SMTP. Sets In-Reply-To/References headers for threading, adds a "Re:" subject prefix, and quotes the original message. Get UIDs from list_emails or search_emails.',
+                        annotations: { title: 'Reply to Email', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of the email to reply to'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the original email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                text: {
+                                    type: 'string',
+                                    description: 'Plain text body of the reply (the quoted original is appended automatically)'
+                                },
+                                html: {
+                                    type: 'string',
+                                    description: 'Optional HTML body of the reply (the quoted original is appended automatically)'
+                                },
+                                replyAll: {
+                                    type: 'boolean',
+                                    description: 'Reply to all original To/CC recipients as well as the sender (default: false)',
+                                    default: false
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['uid', 'text']
+                        }
+                    },
+                    {
+                        name: 'save_draft',
+                        description: 'Save an email to the account\'s Drafts folder (IMAP APPEND with the \\Draft flag) WITHOUT sending it, so a person can review, edit and send it from Yahoo Mail. Pass in_reply_to_uid to make a threaded reply draft: In-Reply-To/References are set, the subject gets a "Re:" prefix, the original is quoted, and recipients default to the sender (like reply_email). Returns the Drafts folder name.',
+                        annotations: { title: 'Save Draft', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'Recipient email addresses (e.g., ["alice@example.com", "Bob <bob@example.com>"]). Required unless in_reply_to_uid is given, in which case it defaults to the reply recipients.'
+                                },
+                                cc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'CC recipient email addresses (optional)'
+                                },
+                                bcc: {
+                                    type: 'array',
+                                    items: { type: 'string' },
+                                    description: 'BCC recipient email addresses (optional; kept in the draft so they survive review)'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject line. Required unless in_reply_to_uid is given, in which case it defaults to "Re: <original subject>".'
+                                },
+                                text: {
+                                    type: 'string',
+                                    description: 'Plain text body of the draft (for reply drafts, the quoted original is appended automatically)'
+                                },
+                                html: {
+                                    type: 'string',
+                                    description: 'Optional HTML body. When provided, the draft is multipart with both text and HTML versions.'
+                                },
+                                in_reply_to_uid: {
+                                    type: 'number',
+                                    description: 'Optional UID of an email to reply to, making this a threaded reply draft. Get UIDs from list_emails or search_emails.'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the in_reply_to_uid email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                replyAll: {
+                                    type: 'boolean',
+                                    description: 'Reply drafts only, when cc is not given: CC all original To/CC recipients except yourself (default: false)',
+                                    default: false
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['text']
+                        }
+                    },
+                    {
+                        name: 'get_thread',
+                        description: 'Get the conversation thread of an email by UID. Follows its Message-ID/References/In-Reply-To headers and searches its folder, INBOX and Sent for the other messages; returns up to 50 messages oldest first with uid, folder, from, to, date, subject and a 500-character snippet.',
+                        annotations: { title: 'Get Thread', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of any email in the thread'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['uid']
+                        }
+                    },
+                    {
+                        name: 'get_attachments',
+                        description: 'List attachments of an email by UID (filename, contentType, size, index). Pass index or filename to download one attachment as base64 (max 10 MB).',
+                        annotations: { title: 'Get Attachments', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of the email containing the attachments'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the email (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                index: {
+                                    type: 'number',
+                                    description: 'Zero-based index of the attachment to download (from the listing). Omit both index and filename to list attachments only.'
+                                },
+                                filename: {
+                                    type: 'string',
+                                    description: 'Filename of the attachment to download (used when index is not provided)'
+                                },
+                                account: {
+                                    type: 'number',
+                                    description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
+                                    default: 1
+                                }
+                            },
+                            required: ['uid']
+                        }
+                    },
+                    {
+                        name: 'get_mailbox_stats',
+                        description: 'Get message counts for a folder (total, unread, recent) using a lightweight IMAP STATUS command',
+                        annotations: { title: 'Get Mailbox Stats', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder to get stats for (default: INBOX). Use list_folders to see available folders.',
+                                    default: 'INBOX'
+                                },
                                 account: {
                                     type: 'number',
                                     description: 'Which Yahoo account to use: 1 for primary (default), 2 for secondary account',
@@ -367,10 +611,12 @@ class YahooMailMCPServer {
      */
     async handleToolCall(name, args) {
         try {
-            const account = args?.account || 1;
+            // Strict: the SDK doesn't validate inputSchema, so "2" or 3 must not silently fall back to account 1
+            const account = Number(args?.account ?? 1);
+            if (account !== 1 && account !== 2) throw new Error('account must be 1 or 2');
             switch (name) {
                     case 'list_emails':
-                        return await this.listEmails(args?.count || 10, args?.folder || 'INBOX', args?.offset || 0, account);
+                        return await this.listEmails(args?.count ?? 10, args?.folder || 'INBOX', args?.offset ?? 0, account);
 
                     case 'read_email':
                         return await this.readEmail(args.uids, args.folder, account);
@@ -409,6 +655,52 @@ class YahooMailMCPServer {
                     case 'list_folders':
                         return await this.listFolders(account);
 
+                    case 'send_email':
+                        return await this.sendEmail({
+                            to: args?.to,
+                            cc: args?.cc,
+                            bcc: args?.bcc,
+                            subject: args?.subject,
+                            text: args?.text,
+                            html: args?.html
+                        }, account);
+
+                    case 'reply_email':
+                        return await this.replyEmail(args?.uid, {
+                            folder: args?.folder || 'INBOX',
+                            text: args?.text,
+                            html: args?.html,
+                            replyAll: args?.replyAll ?? args?.reply_all ?? false
+                        }, account);
+
+                    case 'save_draft':
+                        return await this.saveDraft({
+                            to: args?.to,
+                            cc: args?.cc,
+                            bcc: args?.bcc,
+                            subject: args?.subject,
+                            text: args?.text,
+                            html: args?.html,
+                            inReplyToUid: args?.in_reply_to_uid ?? args?.inReplyToUid,
+                            folder: args?.folder || 'INBOX',
+                            replyAll: args?.replyAll ?? args?.reply_all ?? false
+                        }, account);
+
+                    case 'get_thread':
+                        return await this.getThread(args?.uid, {
+                            folder: args?.folder || 'INBOX'
+                        }, account);
+
+                    case 'get_attachments':
+                        return await this.getAttachments(args?.uid, {
+                            folder: args?.folder || 'INBOX',
+                            index: args?.index,
+                            filename: args?.filename
+                        }, account);
+
+                    case 'get_mailbox_stats':
+                        return await this.getMailboxStats(args?.folder || 'INBOX', account);
+
                     default:
                         throw new Error(`Unknown tool: ${name}`);
                 }
@@ -419,7 +711,8 @@ class YahooMailMCPServer {
                             type: 'text',
                             text: `Error: ${error.message}`
                         }
-                    ]
+                    ],
+                    isError: true
                 };
             }
     }
@@ -444,6 +737,11 @@ class YahooMailMCPServer {
      */
     async createImapConnection(account = 1) {
         return new Promise((resolve, reject) => {
+            account = Number(account);
+            if (account !== 1 && account !== 2) {
+                reject(new Error('account must be 1 or 2'));
+                return;
+            }
             const emailVar = account === 2 ? 'YAHOO_EMAIL_2' : 'YAHOO_EMAIL';
             const passVar = account === 2 ? 'YAHOO_APP_PASSWORD_2' : 'YAHOO_APP_PASSWORD';
             const email = process.env[emailVar];
@@ -459,9 +757,9 @@ class YahooMailMCPServer {
             const imap = new Imap({
                 user: email,
                 password: password,
-                host: 'imap.mail.yahoo.com',
-                port: 993,
-                tls: true,
+                host: process.env.IMAP_HOST || 'imap.mail.yahoo.com',
+                port: Number(process.env.IMAP_PORT) || 993,
+                tls: process.env.IMAP_TLS !== 'false',
                 authTimeout: 30000,
                 connTimeout: 30000,
                 tlsOptions: {
@@ -517,16 +815,78 @@ class YahooMailMCPServer {
     }
 
     /**
+     * Run an IMAP operation on a fresh connection. executor(imap, resolve, reject) has the
+     * shape of a Promise executor. The call settles even if the connection errors or closes
+     * mid-operation (node-imap has no socket timeout), or after timeoutMs, and the connection
+     * is always closed afterwards.
+     */
+    async withImap(account, executor, timeoutMs = 60000) {
+        const imap = await this.createImapConnection(account);
+
+        // Make end() idempotent and remember that a close after it is expected
+        let ending = false;
+        const end = imap.end.bind(imap);
+        imap.end = () => {
+            if (ending) return;
+            ending = true;
+            end();
+        };
+
+        const destroy = () => {
+            if (imap.state === 'disconnected') return;
+            try {
+                imap.destroy();
+                imap._sock?.destroy();
+            } catch (e) {
+                console.error('[IMAP] Failed to destroy connection:', e.message);
+            }
+        };
+
+        let timer;
+        let broken = false;
+        const guard = new Promise((_, reject) => {
+            const fail = (message) => {
+                broken = true;
+                reject(new Error(message));
+            };
+            imap.on('error', (err) => fail(`IMAP connection error: ${err.message}`));
+            imap.once('close', () => {
+                if (!ending) fail('IMAP connection closed before the operation completed');
+            });
+            timer = setTimeout(() => fail(`IMAP operation timed out after ${timeoutMs / 1000}s`), timeoutMs);
+        });
+        const operation = new Promise((resolve, reject) => executor(imap, resolve, reject));
+
+        try {
+            return await Promise.race([operation, guard]);
+        } finally {
+            clearTimeout(timer);
+            if (broken) {
+                destroy();
+            } else {
+                imap.end();
+                // Don't let a server that never answers LOGOUT keep the socket open
+                setTimeout(destroy, 10000).unref();
+            }
+        }
+    }
+
+    /**
      * List recent emails with enriched metadata
      */
     async listEmails(count = 10, folder = 'INBOX', offset = 0, account = 1) {
+        count = Number(count);
+        offset = Number(offset);
+        folder = this.sanitizeText(folder, 'folder');
+
         // Validate count parameter
-        if (count < 1) {
+        if (!Number.isInteger(count) || count < 1) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: count must be at least 1'
-                }]
+                }],
+                isError: true
             };
         }
 
@@ -535,23 +895,23 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: 'Error: count cannot exceed 50 (use search or filters for larger results)'
-                }]
+                }],
+                isError: true
             };
         }
 
         // Validate offset
-        if (offset < 0) {
+        if (!Number.isInteger(offset) || offset < 0) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: offset must be non-negative'
-                }]
+                }],
+                isError: true
             };
         }
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -583,7 +943,8 @@ class YahooMailMCPServer {
                 const startSeq = Math.max(1, total - offset - count + 1);
                 const endSeq = Math.max(1, total - offset);
 
-                if (startSeq > endSeq) {
+                // Paging past the end must return nothing (the range math would clamp to message 1)
+                if (offset >= total || startSeq > endSeq) {
                     imap.end();
                     resolve({
                         content: [{
@@ -604,18 +965,19 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let header = '';
+                    const chunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            header += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -624,7 +986,7 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        const parsed = Imap.parseHeader(header);
+                        const parsed = Imap.parseHeader(Buffer.concat(chunks).toString('utf8'));
 
                         emails.push({
                             uid: attrs.uid,                          // NEW: Permanent UID
@@ -683,7 +1045,7 @@ class YahooMailMCPServer {
      * Search emails with advanced filters
      */
     async searchEmails(query, options = {}, account = 1) {
-        const {
+        let {
             count = 10,
             dateFrom = null,
             dateTo = null,
@@ -698,23 +1060,43 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: 'Error: query is required (use empty string "" for searches without text criteria)'
-                }]
+                }],
+                isError: true
             };
         }
 
+        // Validate/coerce everything BEFORE connecting: a bad type would otherwise throw
+        // inside a node-imap callback and kill the process, and CR/LF allows IMAP injection
+        query = this.sanitizeText(query, 'query');
+        sender = this.sanitizeText(sender, 'sender');
+        folder = this.sanitizeText(folder, 'folder');
+        count = Number(count);
+        // An unparseable date must fail loudly, not silently drop the filter (e.g. before a bulk delete)
+        const sinceDate = dateFrom ? this.toImapSearchDate(dateFrom, 'dateFrom', false) : null;
+        const beforeDate = dateTo ? this.toImapSearchDate(dateTo, 'dateTo', true) : null;
+
         // Validate count parameter
-        if (count < 1) {
+        if (!Number.isInteger(count) || count < 1) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: count must be at least 1'
-                }]
+                }],
+                isError: true
             };
         }
 
-        const imap = await this.createImapConnection(account);
+        if (count > 50) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Error: count cannot exceed 50 (narrow the search with filters)'
+                }],
+                isError: true
+            };
+        }
 
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -739,31 +1121,13 @@ class YahooMailMCPServer {
                     criteria.push(['HEADER', 'FROM', sender]);
                 }
 
-                // Date range filters
-                if (dateFrom) {
-                    try {
-                        const fromDate = new Date(dateFrom);
-                        if (!isNaN(fromDate.getTime())) {
-                            criteria.push(['SINCE', fromDate]);
-                        }
-                    } catch (e) {
-                        imap.end();
-                        reject(new Error(`Invalid dateFrom format: ${dateFrom}. Use ISO 8601 format.`));
-                        return;
-                    }
+                // Date range filters (validated before connecting; dateTo is inclusive)
+                if (sinceDate) {
+                    criteria.push(['SINCE', sinceDate]);
                 }
 
-                if (dateTo) {
-                    try {
-                        const toDate = new Date(dateTo);
-                        if (!isNaN(toDate.getTime())) {
-                            criteria.push(['BEFORE', toDate]);
-                        }
-                    } catch (e) {
-                        imap.end();
-                        reject(new Error(`Invalid dateTo format: ${dateTo}. Use ISO 8601 format.`));
-                        return;
-                    }
+                if (beforeDate) {
+                    criteria.push(['BEFORE', beforeDate]);
                 }
 
                 // Unread only filter
@@ -807,18 +1171,19 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                        size: true
                     });
 
                     const emails = [];
 
                     fetch.on('message', (msg, seqno) => {
-                        let header = '';
+                        const chunks = [];
                         let attrs = null;
 
                         msg.on('body', (stream, info) => {
                             stream.on('data', (chunk) => {
-                                header += chunk.toString('ascii');
+                                chunks.push(chunk);
                             });
                         });
 
@@ -827,7 +1192,7 @@ class YahooMailMCPServer {
                         });
 
                         msg.once('end', () => {
-                            const parsed = Imap.parseHeader(header);
+                            const parsed = Imap.parseHeader(Buffer.concat(chunks).toString('utf8'));
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,
@@ -907,13 +1272,13 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
+        folder = this.sanitizeText(folder, 'folder');
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, false, (err, box) => {  // false = read-write mode
                 if (err) {
                     imap.end();
@@ -923,11 +1288,12 @@ class YahooMailMCPServer {
 
                 const successfulUIDs = [];
                 const failedUIDs = [];
+                const existingUIDs = [];
                 let processedCount = 0;
 
                 // Process each UID individually to ensure all are processed
                 const processNextUID = () => {
-                    if (processedCount >= uids.length) {
+                    if (processedCount >= existingUIDs.length) {
                         // All UIDs processed
                         imap.end();
 
@@ -953,7 +1319,7 @@ class YahooMailMCPServer {
                         return;
                     }
 
-                    const uid = uids[processedCount];
+                    const uid = existingUIDs[processedCount];
                     processedCount++;
 
                     // Execute the UID-based operation for this single UID
@@ -970,8 +1336,28 @@ class YahooMailMCPServer {
                     });
                 };
 
-                // Start processing
-                processNextUID();
+                // UID STORE/MOVE return OK for UIDs that don't exist, so look them up first:
+                // missing UIDs are reported as failed and only existing ones are acted on
+                imap.search([['UID', ...uids]], (err, found) => {
+                    if (err) {
+                        imap.end();
+                        reject(new Error(`Failed to look up UIDs in "${folder}": ${err.message}`));
+                        return;
+                    }
+
+                    const foundSet = new Set(found || []);
+                    for (const uid of uids) {
+                        if (foundSet.has(uid)) {
+                            existingUIDs.push(uid);
+                        } else {
+                            console.error(`[UID ${uid}] Not found in "${folder}"; skipped`);
+                            failedUIDs.push(uid);
+                        }
+                    }
+
+                    // Start processing
+                    processNextUID();
+                });
             });
         });
     }
@@ -987,13 +1373,13 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
+        folder = this.sanitizeText(folder, 'folder');
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {  // true = read-only mode
                 if (err) {
                     imap.end();
@@ -1001,24 +1387,28 @@ class YahooMailMCPServer {
                     return;
                 }
 
-                const source = uids.join(',');
+                // Pass the array: a joined "1,2,3" string is parseInt'd by node-imap to just the first UID
+                const source = uids;
 
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parseJobs = [];
+                const parseErrors = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];  // raw bytes: decoding chunks individually corrupts non-ASCII bodies
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -1028,12 +1418,9 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
+                        // Parsing is async: collect the promises so fetch 'end' can wait for them.
+                        // keepCidLinks stops inline images being embedded into the html as data: URIs.
+                        parseJobs.push(simpleParser(Buffer.concat(chunks), { keepCidLinks: true }).then((parsed) => {
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,  // Still include for reference
@@ -1044,9 +1431,12 @@ class YahooMailMCPServer {
                                 size: attrs.size || 0,
                                 flags: attrs.flags || [],
                                 hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
+                                content: this.extractBodyText(parsed)
                             });
-                        });
+                        }).catch((err) => {
+                            console.error(`[UID ${attrs?.uid}] Error parsing email:`, err);
+                            parseErrors.push({ uid: attrs?.uid, message: err.message });
+                        }));
                     });
                 });
 
@@ -1055,8 +1445,11 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+
+                    // 'end' fires before the async parses finish; wait for them (each job catches its own error)
+                    await Promise.all(parseJobs);
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
@@ -1086,10 +1479,21 @@ class YahooMailMCPServer {
                         `${email.content}`
                     ).join('\n\n' + '='.repeat(80) + '\n\n');
 
+                    // Surface per-UID parse failures instead of silently dropping those emails
+                    const parseErrorText = parseErrors
+                        .map(e => `Failed to parse email UID ${e.uid}: ${e.message}`)
+                        .join('\n');
+                    if (emails.length === 0 && parseErrors.length > 0) {
+                        reject(new Error(parseErrorText));
+                        return;
+                    }
+
                     resolve({
                         content: [{
                             type: 'text',
-                            text: emailContent
+                            text: parseErrorText
+                                ? `${emailContent}\n\n${'='.repeat(80)}\n\n${parseErrorText}`
+                                : emailContent
                         }]
                     });
                 });
@@ -1179,6 +1583,10 @@ class YahooMailMCPServer {
      * Move emails to a specific folder
      */
     async moveEmails(uids, folderName, sourceFolder = 'INBOX', account = 1) {
+        if (folderName === undefined || folderName === null || folderName === '') {
+            throw new Error('folderName is required');
+        }
+        folderName = this.sanitizeText(folderName, 'folderName');
         return this.modifyEmails(
             uids,
             (imap, source, callback) => imap.move(source, folderName, callback),  // NO .seq
@@ -1199,7 +1607,7 @@ class YahooMailMCPServer {
             if (!part) return false;
 
             // Check if this part is an attachment
-            if (part.disposition && part.disposition.type === 'attachment') {
+            if (part.disposition && String(part.disposition.type).toLowerCase() === 'attachment') {
                 return true;
             }
 
@@ -1212,6 +1620,68 @@ class YahooMailMCPServer {
         };
 
         return checkPart(struct);
+    }
+
+    /**
+     * Helper: Coerce a text argument to a string and reject CR/LF/NUL, which would let
+     * the value inject raw IMAP commands. null/undefined pass through unchanged.
+     */
+    sanitizeText(value, name) {
+        if (value === undefined || value === null) return value;
+        const str = String(value);
+        if (/[\r\n\0]/.test(str)) {
+            throw new Error(`${name} must not contain line breaks or NUL characters`);
+        }
+        return str;
+    }
+
+    /**
+     * Helper: Convert a user date to the Date node-imap needs for SINCE/BEFORE.
+     * Throws on unparseable input. node-imap formats search dates with local-time getters,
+     * so rebuild from UTC components to keep the calendar date the caller meant.
+     * isTo makes the end date inclusive (BEFORE the following day).
+     */
+    toImapSearchDate(value, name, isTo) {
+        const d = new Date(value);
+        if (isNaN(d.getTime())) {
+            throw new Error(`Invalid ${name}: "${value}". Use ISO 8601 format (e.g. 2024-01-31).`);
+        }
+        return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + (isTo ? 1 : 0));
+    }
+
+    /**
+     * Helper: Plain-text body of a parsed email, bounded in size. Prefers the text part;
+     * otherwise strips tags from the html.
+     */
+    extractBodyText(parsed, maxChars = 20000) {
+        let body = parsed.text;
+        if (!body && parsed.html) {
+            body = this.htmlToText(parsed.html);
+        }
+        if (!body) return 'No content available';
+        if (body.length > maxChars) {
+            body = `${body.slice(0, maxChars)}\n\n[truncated: showing first ${maxChars} of ${body.length} characters]`;
+        }
+        return body;
+    }
+
+    /**
+     * Helper: Strip tags from html, keeping line breaks and decoding common entities
+     */
+    htmlToText(html) {
+        return String(html)
+            .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
+            .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6])>/gi, '\n')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'")
+            .replace(/&amp;/gi, '&')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n\s*\n\s*\n+/g, '\n\n')
+            .trim();
     }
 
     /**
@@ -1277,9 +1747,7 @@ class YahooMailMCPServer {
      * List all available IMAP folders
      */
     async listFolders(account = 1) {
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.getBoxes((err, boxes) => {
                 imap.end();
 
@@ -1301,6 +1769,1179 @@ class YahooMailMCPServer {
                 });
             });
         });
+    }
+
+    /**
+     * Get folder message counts via IMAP STATUS (does not open/select the folder)
+     */
+    async getMailboxStats(folder = 'INBOX', account = 1) {
+        return this.withImap(account, (imap, resolve, reject) => {
+            imap.status(folder, (err, box) => {
+                imap.end();
+
+                if (err) {
+                    reject(new Error(`Failed to get status for folder "${folder}": ${err.message}`));
+                    return;
+                }
+
+                resolve({
+                    content: [{
+                        type: 'text',
+                        text: JSON.stringify({
+                            folder: folder,
+                            totalMessages: box.messages?.total ?? 0,
+                            unreadMessages: box.messages?.unseen ?? 0,
+                            recentMessages: box.messages?.new ?? 0,
+                            uidNext: box.uidnext,
+                            uidValidity: box.uidvalidity
+                        }, null, 2)
+                    }]
+                });
+            });
+        });
+    }
+
+    /**
+     * Helper: Fetch a single raw message (as a Buffer) by UID
+     */
+    async fetchRawMessage(uid, folder = 'INBOX', account = 1) {
+        return this.withImap(account, (imap, resolve, reject) => {
+            imap.openBox(folder, true, (err, box) => {  // true = read-only mode
+                if (err) {
+                    imap.end();
+                    reject(new Error(`Failed to open folder "${folder}": ${err.message}`));
+                    return;
+                }
+
+                // Check RFC822.SIZE first so an oversized message is never downloaded into memory
+                let size = null;
+                const sizeFetch = imap.fetch(uid.toString(), { size: true });
+                sizeFetch.on('message', (msg) => {
+                    msg.once('attributes', (a) => { size = a.size; });
+                });
+                sizeFetch.once('error', (err) => {
+                    imap.end();
+                    reject(err);
+                });
+                sizeFetch.once('end', () => {
+                    if (typeof size === 'number' && size > MAX_RAW_MESSAGE_SIZE_BYTES) {
+                        imap.end();
+                        reject(new Error(
+                            `Message UID ${uid} is too large to process (${(size / 1024 / 1024).toFixed(1)} MB; ` +
+                            `limit is ${MAX_RAW_MESSAGE_SIZE_BYTES / 1024 / 1024} MB).`
+                        ));
+                        return;
+                    }
+                    fetchBody();
+                });
+
+                const fetchBody = () => {
+                // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
+                const fetch = imap.fetch(uid.toString(), {
+                    bodies: '',
+                    struct: true
+                });
+
+                // Collect raw Buffers (not ASCII strings) so 8-bit and binary content survives
+                const chunks = [];
+                let attrs = null;
+
+                fetch.on('message', (msg, seqno) => {
+                    msg.on('body', (stream, info) => {
+                        stream.on('data', (chunk) => {
+                            chunks.push(chunk);
+                        });
+                    });
+
+                    msg.once('attributes', (attributes) => {
+                        attrs = attributes;
+                    });
+                });
+
+                fetch.once('error', (err) => {
+                    imap.end();
+                    reject(err);
+                });
+
+                fetch.once('end', () => {
+                    imap.end();
+
+                    if (!attrs) {
+                        reject(new Error(
+                            `UID not found: ${uid}. ` +
+                            `It may have been deleted or moved to another folder than "${folder}".`
+                        ));
+                        return;
+                    }
+
+                    resolve({ raw: Buffer.concat(chunks), attrs: attrs });
+                });
+                };
+            });
+        });
+    }
+
+    /**
+     * Helper: Validate a single UID
+     * @returns {string|null} Error message if invalid, null if valid
+     */
+    validateUID(uid) {
+        if (uid === undefined || uid === null) {
+            return 'uid is required';
+        }
+
+        if (typeof uid !== 'number' || !Number.isInteger(uid) || uid <= 0) {
+            return 'uid must be a positive integer';
+        }
+
+        return null;
+    }
+
+    /**
+     * Helper: Resolve email/app-password for an account (same env vars as createImapConnection)
+     * @param {number} account - 1 for primary account (YAHOO_EMAIL), 2 for secondary (YAHOO_EMAIL_2)
+     */
+    getAccountCredentials(account = 1) {
+        const emailVar = account === 2 ? 'YAHOO_EMAIL_2' : 'YAHOO_EMAIL';
+        const passVar = account === 2 ? 'YAHOO_APP_PASSWORD_2' : 'YAHOO_APP_PASSWORD';
+        const email = process.env[emailVar];
+        const password = process.env[passVar];
+
+        if (!email || !password) {
+            const error = new Error(`${emailVar} or ${passVar} environment variables are not set`);
+            console.error('[SMTP] Configuration error:', error.message);
+            throw error;
+        }
+
+        return { email, password };
+    }
+
+    /**
+     * Create SMTP transport for Yahoo Mail using the same app-specific password as IMAP
+     */
+    createSmtpTransport(account = 1) {
+        const { email, password } = this.getAccountCredentials(account);
+
+        const transporter = nodemailer.createTransport({
+            host: process.env.SMTP_HOST || 'smtp.mail.yahoo.com',
+            port: Number(process.env.SMTP_PORT) || 465,
+            secure: process.env.SMTP_SECURE !== 'false',
+            auth: {
+                user: email,
+                pass: password
+            },
+            connectionTimeout: 30000,
+            greetingTimeout: 30000,
+            socketTimeout: 60000,
+            // Message content comes from tool arguments: never let it pull in local files or URLs
+            disableFileAccess: true,
+            disableUrlAccess: true,
+            tls: {
+                rejectUnauthorized: true,
+                servername: 'smtp.mail.yahoo.com',
+                minVersion: 'TLSv1.2'
+            }
+        });
+
+        return { transporter, email };
+    }
+
+    /**
+     * Helper: Send a message via Yahoo SMTP with enhanced error messages
+     */
+    async sendViaSmtp(mailOptions, account = 1) {
+        const { transporter, email } = this.createSmtpTransport(account);
+
+        try {
+            const info = await transporter.sendMail({ ...mailOptions, from: email });
+            return { info, from: email };
+        } catch (err) {
+            console.error('[SMTP] Send error:', err.message);
+
+            let errorMessage = err.message;
+
+            // Authentication errors
+            if (err.code === 'EAUTH' || err.responseCode === 535) {
+                errorMessage = `SMTP authentication failed: ${err.message}. Please check Yahoo Mail app password. Regenerate at https://login.yahoo.com/account/security`;
+            }
+            // Network/connection errors
+            else if (['ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'EDNS', 'ETLS'].includes(err.code)) {
+                errorMessage = `Cannot connect to Yahoo SMTP server: ${err.message}. Check internet connection.`;
+            }
+            // Recipient errors
+            else if (err.code === 'EENVELOPE') {
+                errorMessage = `Yahoo SMTP server rejected the recipients: ${err.message}`;
+            }
+
+            throw new Error(errorMessage);
+        } finally {
+            transporter.close();
+        }
+    }
+
+    /**
+     * Helper: Parse recipients (string or array of strings) into { name, address } objects
+     * @returns {{addresses: Array<{name: string, address: string}>, error: string|null}}
+     */
+    parseAddressList(value, fieldName) {
+        if (value === undefined || value === null || value === '') {
+            return { addresses: [], error: null };
+        }
+
+        const items = Array.isArray(value) ? value : [value];
+        const addresses = [];
+
+        for (const item of items) {
+            if (typeof item !== 'string') {
+                return { addresses: [], error: `${fieldName} must be an array of email address strings` };
+            }
+
+            // Group syntax ("team: a@x.com, b@y.com;") makes addressparser silently rewrite the
+            // recipient list, and CR/LF could inject headers - reject them outright.
+            if (/[:;\r\n]/.test(item)) {
+                return {
+                    addresses: [],
+                    error: `${fieldName} contains an unsupported character (":", ";", CR or LF): "${item.replace(/[\r\n]/g, ' ')}". ` +
+                        'Group syntax is not supported; list each address separately.'
+                };
+            }
+
+            const parsedList = addressparser(item, { flatten: true });
+            const atCount = (item.match(/@/g) || []).length;
+            if (atCount > parsedList.length || parsedList.some(p => (p.name || '').includes('@'))) {
+                return {
+                    addresses: [],
+                    error: `${fieldName} could not be parsed unambiguously: "${item}". ` +
+                        'Separate multiple addresses with commas or pass them as an array.'
+                };
+            }
+
+            for (const parsed of parsedList) {
+                const address = (parsed.address || '').trim();
+
+                if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(address)) {
+                    return {
+                        addresses: [],
+                        error: `${fieldName} contains an invalid email address: "${parsed.address || parsed.name || item}"`
+                    };
+                }
+
+                addresses.push({ name: parsed.name || '', address: address });
+            }
+        }
+
+        return { addresses, error: null };
+    }
+
+    /**
+     * Helper: Flatten a mailparser address field (object or array of objects, may contain groups)
+     */
+    flattenParsedAddresses(field) {
+        if (!field) return [];
+
+        const result = [];
+        const walk = (entries) => {
+            for (const entry of entries || []) {
+                if (entry.group) {
+                    walk(entry.group);
+                } else if (entry.address) {
+                    result.push({ name: entry.name || '', address: entry.address });
+                }
+            }
+        };
+
+        for (const item of (Array.isArray(field) ? field : [field])) {
+            walk(item.value);
+        }
+
+        return result;
+    }
+
+    /**
+     * Helper: Remove duplicate addresses (case-insensitive), skipping any in excludeAddresses
+     */
+    dedupeAddresses(addresses, excludeAddresses = []) {
+        const seen = new Set(excludeAddresses.map(a => a.toLowerCase()));
+        const result = [];
+
+        for (const addr of addresses) {
+            const key = addr.address.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push(addr);
+        }
+
+        return result;
+    }
+
+    /**
+     * Helper: Format { name, address } objects as display strings
+     */
+    formatAddresses(addresses) {
+        return addresses.map(a => a.name ? `${a.name} <${a.address}>` : a.address);
+    }
+
+    /**
+     * Helper: Escape text for safe inclusion in HTML
+     */
+    escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    /**
+     * Send a new email via Yahoo SMTP
+     */
+    async sendEmail(message, account = 1) {
+        const { subject, text, html } = message;
+
+        const to = this.parseAddressList(message.to, 'to');
+        const cc = this.parseAddressList(message.cc, 'cc');
+        const bcc = this.parseAddressList(message.bcc, 'bcc');
+
+        // Validate input
+        let validationError = to.error || cc.error || bcc.error;
+        if (!validationError && to.addresses.length === 0) {
+            validationError = 'to must contain at least one recipient';
+        }
+        if (!validationError && typeof subject !== 'string') {
+            validationError = 'subject is required';
+        }
+        if (!validationError && typeof text !== 'string') {
+            validationError = 'text is required';
+        }
+        if (!validationError && html !== undefined && html !== null && typeof html !== 'string') {
+            validationError = 'html must be a string';
+        }
+
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }],
+                isError: true
+            };
+        }
+
+        const cleanSubject = subject.replace(/[\r\n]+/g, ' ');
+
+        const { info, from } = await this.sendViaSmtp({
+            to: to.addresses,
+            cc: cc.addresses.length > 0 ? cc.addresses : undefined,
+            bcc: bcc.addresses.length > 0 ? bcc.addresses : undefined,
+            subject: cleanSubject,
+            text: text,
+            html: html || undefined
+        }, account);
+
+        return {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    success: true,
+                    messageId: info.messageId,
+                    from: from,
+                    to: this.formatAddresses(to.addresses),
+                    cc: this.formatAddresses(cc.addresses),
+                    bcc: this.formatAddresses(bcc.addresses),
+                    subject: cleanSubject,
+                    accepted: info.accepted || [],
+                    rejected: info.rejected || [],
+                    account: account,
+                    sentFolder: 'No copy appended via IMAP; Yahoo normally saves SMTP-sent mail to the Sent folder automatically.'
+                }, null, 2)
+            }]
+        };
+    }
+
+    /**
+     * Reply to an email (by UID) via Yahoo SMTP with proper threading headers
+     */
+    async replyEmail(uid, options = {}, account = 1) {
+        const {
+            folder = 'INBOX',
+            text,
+            html,
+            replyAll = false
+        } = options;
+
+        // Validate input
+        let validationError = this.validateUID(uid);
+        if (!validationError && typeof text !== 'string') {
+            validationError = 'text is required';
+        }
+        if (!validationError && html !== undefined && html !== null && typeof html !== 'string') {
+            validationError = 'html must be a string';
+        }
+
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }],
+                isError: true
+            };
+        }
+
+        const { raw } = await this.fetchRawMessage(uid, folder, account);
+        const original = await simpleParser(raw);
+        const { email } = this.getAccountCredentials(account);
+        const ownAddress = email.toLowerCase();
+
+        const {
+            to: replyTo,
+            cc: replyCc,
+            subject: replySubject,
+            text: replyText,
+            html: replyHtml,
+            inReplyTo: originalMessageId,
+            references
+        } = this.buildReplyFields(original, ownAddress, { text, html, replyAll, uid });
+
+        const mailOptions = {
+            to: replyTo,
+            cc: replyCc.length > 0 ? replyCc : undefined,
+            subject: replySubject,
+            text: replyText,
+            html: replyHtml
+        };
+        if (originalMessageId) {
+            mailOptions.inReplyTo = originalMessageId;
+        }
+        if (references.length > 0) {
+            mailOptions.references = references;
+        }
+
+        const { info, from } = await this.sendViaSmtp(mailOptions, account);
+
+        const result = {
+            success: true,
+            messageId: info.messageId,
+            from: from,
+            to: this.formatAddresses(replyTo),
+            cc: this.formatAddresses(replyCc),
+            subject: replySubject,
+            replyAll: !!replyAll,
+            inReplyTo: originalMessageId,
+            references: references,
+            originalUid: uid,
+            folder: folder,
+            accepted: info.accepted || [],
+            rejected: info.rejected || [],
+            account: account,
+            sentFolder: 'No copy appended via IMAP; Yahoo normally saves SMTP-sent mail to the Sent folder automatically.'
+        };
+        if (!originalMessageId) {
+            result.warning = 'Original email has no Message-ID header; the reply may not thread in mail clients.';
+        }
+
+        return {
+            content: [{
+                type: 'text',
+                text: JSON.stringify(result, null, 2)
+            }]
+        };
+    }
+
+    /**
+     * List attachments of an email, or return one attachment's content as base64
+     */
+    async getAttachments(uid, options = {}, account = 1) {
+        const {
+            folder = 'INBOX',
+            index,
+            filename
+        } = options;
+
+        const hasIndex = index !== undefined && index !== null;
+        const hasFilename = typeof filename === 'string' && filename.length > 0;
+
+        // Validate input
+        let validationError = this.validateUID(uid);
+        if (!validationError && hasIndex && (typeof index !== 'number' || !Number.isInteger(index) || index < 0)) {
+            validationError = 'index must be a non-negative integer';
+        }
+        if (!validationError && filename !== undefined && filename !== null && typeof filename !== 'string') {
+            validationError = 'filename must be a string';
+        }
+
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }],
+                isError: true
+            };
+        }
+
+        const { raw } = await this.fetchRawMessage(uid, folder, account);
+        const parsed = await simpleParser(raw);
+        const attachments = parsed.attachments || [];
+
+        const summaries = attachments.map((att, i) => ({
+            index: i,
+            filename: att.filename || null,
+            contentType: att.contentType || 'application/octet-stream',
+            size: att.content ? att.content.length : (att.size || 0),
+            disposition: att.contentDisposition || null,
+            contentId: att.cid || null
+        }));
+
+        // List mode
+        if (!hasIndex && !hasFilename) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                        uid: uid,
+                        folder: folder,
+                        count: summaries.length,
+                        attachments: summaries,
+                        maxDownloadSize: MAX_ATTACHMENT_SIZE_BYTES
+                    }, null, 2)
+                }]
+            };
+        }
+
+        if (attachments.length === 0) {
+            throw new Error(`Email UID ${uid} has no attachments`);
+        }
+
+        // Download mode: select by index (preferred) or filename
+        let selected;
+        if (hasIndex) {
+            if (index >= attachments.length) {
+                throw new Error(
+                    `Attachment index ${index} is out of range. ` +
+                    `Email UID ${uid} has ${attachments.length} attachment(s) (valid indexes: 0-${attachments.length - 1}).`
+                );
+            }
+            selected = index;
+        } else {
+            let matches = summaries.filter(s => s.filename === filename);
+            if (matches.length === 0) {
+                matches = summaries.filter(s => (s.filename || '').toLowerCase() === filename.toLowerCase());
+            }
+            if (matches.length === 0) {
+                const available = summaries.map(s => s.filename || `(unnamed, index ${s.index})`).join(', ');
+                throw new Error(`No attachment named "${filename}" in email UID ${uid}. Available: ${available}`);
+            }
+            if (matches.length > 1) {
+                const attachmentMatches = matches.filter(s => s.disposition === 'attachment');
+                if (attachmentMatches.length === 1) {
+                    matches = attachmentMatches;
+                } else {
+                    throw new Error(
+                        `Multiple attachments named "${filename}" in email UID ${uid} ` +
+                        `(indexes: ${matches.map(s => s.index).join(', ')}). Pass index instead.`
+                    );
+                }
+            }
+            selected = matches[0].index;
+        }
+
+        const summary = summaries[selected];
+        const content = attachments[selected].content || Buffer.alloc(0);
+
+        if (content.length > MAX_ATTACHMENT_SIZE_BYTES) {
+            const sizeMB = (content.length / (1024 * 1024)).toFixed(1);
+            const limitMB = MAX_ATTACHMENT_SIZE_BYTES / (1024 * 1024);
+            throw new Error(
+                `Attachment "${summary.filename || `index ${selected}`}" is ${sizeMB} MB, ` +
+                `which exceeds the ${limitMB} MB download limit`
+            );
+        }
+
+        return {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    uid: uid,
+                    folder: folder,
+                    ...summary,
+                    encoding: 'base64',
+                    contentBase64: content.toString('base64')
+                }, null, 2)
+            }]
+        };
+    }
+
+    /**
+     * Helper: Promise wrappers for the node-imap calls used by save_draft and get_thread,
+     * so one connection can run several commands in sequence. The caller owns imap.end().
+     */
+    promisifyImap(imap) {
+        return {
+            openBox: (folder, readOnly = true) => new Promise((resolve, reject) => {
+                imap.openBox(folder, readOnly, (err, box) => {
+                    if (err) {
+                        reject(new Error(`Failed to open folder "${folder}": ${err.message}`));
+                        return;
+                    }
+                    resolve(box);
+                });
+            }),
+
+            // CRITICAL: imap.search() returns UIDs by default (NOT sequence numbers)
+            search: (criteria) => new Promise((resolve, reject) => {
+                imap.search(criteria, (err, results) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    resolve(results || []);
+                });
+            }),
+
+            // UID-based fetch; resolves with [{ raw: Buffer, attrs }] (raw Buffers keep 8-bit content intact)
+            fetch: (uids, options) => new Promise((resolve, reject) => {
+                const messages = [];
+                const fetch = imap.fetch(uids, options);
+
+                fetch.on('message', (msg) => {
+                    const chunks = [];
+                    let attrs = null;
+
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => {
+                            chunks.push(chunk);
+                        });
+                    });
+
+                    msg.once('attributes', (attributes) => {
+                        attrs = attributes;
+                    });
+
+                    msg.once('end', () => {
+                        messages.push({ raw: Buffer.concat(chunks), attrs: attrs });
+                    });
+                });
+
+                fetch.once('error', reject);
+                fetch.once('end', () => resolve(messages));
+            }),
+
+            getBoxes: () => new Promise((resolve, reject) => {
+                imap.getBoxes((err, boxes) => {
+                    if (err) {
+                        reject(new Error(`Failed to retrieve folders: ${err.message}`));
+                        return;
+                    }
+                    resolve(boxes || {});
+                });
+            }),
+
+            // Resolves with the appended message's UID when the server reports APPENDUID (UIDPLUS), else null
+            append: (raw, options) => new Promise((resolve, reject) => {
+                imap.append(raw, options, (err, uid) => {
+                    if (err) {
+                        reject(new Error(`Failed to save message to folder "${options.mailbox}": ${err.message}`));
+                        return;
+                    }
+                    resolve(uid ?? null);
+                });
+            })
+        };
+    }
+
+    /**
+     * Helper: Find a folder by RFC 6154 special-use attribute (e.g. '\\Drafts', '\\Sent') in a
+     * getBoxes() tree, falling back to the first existing folder named like one of fallbackNames
+     * (case-insensitive). \\Noselect folders are skipped.
+     * @returns {string|null} Full folder name, or null if none matches
+     */
+    findSpecialUseFolder(boxes, specialUse, fallbackNames = []) {
+        const folders = [];
+        const walk = (tree, parent) => {
+            for (const [name, box] of Object.entries(tree || {})) {
+                const fullName = parent ? `${parent}${box.delimiter || '/'}${name}` : name;
+                const attribs = [...(box.attribs || []), box.special_use_attrib]
+                    .filter(Boolean)
+                    .map(a => String(a).toLowerCase());
+
+                if (!attribs.includes('\\noselect')) {
+                    folders.push({ name: fullName, attribs: attribs });
+                }
+                if (box.children) {
+                    walk(box.children, fullName);
+                }
+            }
+        };
+        walk(boxes, null);
+
+        const wanted = specialUse.toLowerCase();
+        const bySpecialUse = folders.find(f => f.attribs.includes(wanted));
+        if (bySpecialUse) {
+            return bySpecialUse.name;
+        }
+
+        for (const fallback of fallbackNames) {
+            const byName = folders.find(f => f.name === fallback) ||
+                folders.find(f => f.name.toLowerCase() === fallback.toLowerCase());
+            if (byName) {
+                return byName.name;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Helper: Build the reply fields (recipients, "Re:" subject, threading headers, quoted body)
+     * for a parsed original message. Mirrors replyEmail's logic so reply drafts match sent replies.
+     * @param {object} original - simpleParser result for the message being replied to
+     * @param {string} ownAddress - this account's address (lowercase), excluded from reply-all
+     */
+    buildReplyFields(original, ownAddress, options = {}) {
+        const { text, html, replyAll = false, uid } = options;
+
+        const fromList = this.flattenParsedAddresses(original.from);
+        const replyToList = this.flattenParsedAddresses(original.replyTo);
+        const toList = this.flattenParsedAddresses(original.to);
+        const ccList = this.flattenParsedAddresses(original.cc);
+
+        // Replying to our own message (e.g., from Sent) goes back to its original recipients
+        const sentByMe = fromList.some(a => a.address.toLowerCase() === ownAddress);
+        let primaryRecipients;
+        if (sentByMe && toList.length > 0) {
+            primaryRecipients = toList;
+        } else if (replyToList.length > 0) {
+            primaryRecipients = replyToList;
+        } else {
+            primaryRecipients = fromList;
+        }
+
+        const replyTo = this.dedupeAddresses(primaryRecipients);
+        if (replyTo.length === 0) {
+            throw new Error(`Email UID ${uid} has no sender address to reply to`);
+        }
+
+        // Reply-all: everyone on the original To/CC, minus ourselves and the primary recipients
+        const replyCc = replyAll
+            ? this.dedupeAddresses([...toList, ...ccList], [ownAddress, ...replyTo.map(a => a.address)])
+            : [];
+
+        // Subject: add "Re:" unless already present (avoid "Re: Re:")
+        const originalSubject = (original.subject || '').replace(/[\r\n]+/g, ' ').trim();
+        const replySubject = /^re\s*(\[\d+\])?\s*:/i.test(originalSubject)
+            ? originalSubject
+            : `Re: ${originalSubject}`.trim();
+
+        // Threading headers (RFC 5322 section 3.6.4)
+        const originalMessageId = original.messageId || null;
+        let references = [];
+        if (original.references) {
+            references = Array.isArray(original.references)
+                ? [...original.references]
+                : String(original.references).split(/\s+/);
+        } else if (original.inReplyTo) {
+            references = [original.inReplyTo];
+        }
+        references = references.filter(Boolean);
+        if (originalMessageId && !references.includes(originalMessageId)) {
+            references.push(originalMessageId);
+        }
+
+        // Quote the original message
+        const originalDate = original.date instanceof Date && !isNaN(original.date)
+            ? original.date.toUTCString()
+            : 'an earlier date';
+        const attribution = `On ${originalDate}, ${original.from?.text || 'the sender'} wrote:`;
+        const originalText = (original.text || (original.html ? this.htmlToText(original.html) : '')).replace(/\r\n?/g, '\n').trimEnd();
+        const quotedText = originalText
+            .split('\n')
+            .map(line => (line ? `> ${line}` : '>'))
+            .join('\n');
+
+        const replyText = `${text}\n\n${attribution}\n${quotedText}`;
+
+        let replyHtml;
+        if (html) {
+            replyHtml = `${html}\n<br><br>\n<div>${this.escapeHtml(attribution)}</div>\n` +
+                `<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex">\n` +
+                `${this.escapeHtml(originalText).replace(/\n/g, '<br>\n')}\n` +
+                `</blockquote>`;
+        }
+
+        return {
+            to: replyTo,
+            cc: replyCc,
+            subject: replySubject,
+            text: replyText,
+            html: replyHtml,
+            inReplyTo: originalMessageId,
+            references: references
+        };
+    }
+
+    /**
+     * Helper: Compose an RFC 5322 message with nodemailer's MailComposer (no SMTP involved)
+     * @returns {Promise<{raw: Buffer, messageId: string}>}
+     */
+    async buildDraftMime(mail) {
+        const message = new MailComposer({
+            ...mail,
+            // Message content comes from tool arguments: never let it pull in local files or URLs
+            disableFileAccess: true,
+            disableUrlAccess: true
+        }).compile();
+
+        // Unlike a sent message, a draft keeps its Bcc header so the recipients survive review
+        message.keepBcc = true;
+
+        const raw = await message.build();
+        return { raw, messageId: message.messageId() };
+    }
+
+    /**
+     * Save a draft (optionally a threaded reply) to the account's Drafts folder via IMAP APPEND.
+     * Nothing is sent.
+     */
+    async saveDraft(message, account = 1) {
+        const {
+            subject,
+            text,
+            html,
+            inReplyToUid,
+            folder = 'INBOX',
+            replyAll = false
+        } = message;
+
+        const isReply = inReplyToUid !== undefined && inReplyToUid !== null;
+        const to = this.parseAddressList(message.to, 'to');
+        const cc = this.parseAddressList(message.cc, 'cc');
+        const bcc = this.parseAddressList(message.bcc, 'bcc');
+        const hasSubject = typeof subject === 'string' && (subject.length > 0 || !isReply);
+
+        // Validate input
+        let validationError = to.error || cc.error || bcc.error;
+        if (!validationError && isReply) {
+            const uidError = this.validateUID(inReplyToUid);
+            if (uidError) {
+                validationError = uidError.replace(/^uid\b/, 'in_reply_to_uid');
+            }
+        }
+        if (!validationError && !isReply && to.addresses.length === 0) {
+            validationError = 'to must contain at least one recipient (or pass in_reply_to_uid to draft a reply)';
+        }
+        if (!validationError && subject !== undefined && subject !== null && typeof subject !== 'string') {
+            validationError = 'subject must be a string';
+        }
+        if (!validationError && !isReply && !hasSubject) {
+            validationError = 'subject is required';
+        }
+        if (!validationError && typeof text !== 'string') {
+            validationError = 'text is required';
+        }
+        if (!validationError && html !== undefined && html !== null && typeof html !== 'string') {
+            validationError = 'html must be a string';
+        }
+
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection(account);
+        const client = this.promisifyImap(imap);
+
+        try {
+            const { email } = this.getAccountCredentials(account);
+
+            let reply = null;
+            if (isReply) {
+                await client.openBox(folder, true);  // true = read-only mode
+                const [original] = await client.fetch([inReplyToUid], { bodies: '' });
+                if (!original) {
+                    throw new Error(
+                        `UID not found: ${inReplyToUid}. ` +
+                        `It may have been deleted or moved to another folder than "${folder}".`
+                    );
+                }
+                reply = this.buildReplyFields(await simpleParser(original.raw), email.toLowerCase(), {
+                    text, html, replyAll, uid: inReplyToUid
+                });
+            }
+
+            // Explicit to/cc/subject override the reply defaults
+            const draftTo = to.addresses.length > 0 ? to.addresses : reply.to;
+            const draftCc = cc.addresses.length > 0 ? cc.addresses : (reply ? reply.cc : []);
+            const draftSubject = hasSubject ? subject.replace(/[\r\n]+/g, ' ') : reply.subject;
+
+            const mail = {
+                from: email,
+                to: draftTo,
+                cc: draftCc.length > 0 ? draftCc : undefined,
+                bcc: bcc.addresses.length > 0 ? bcc.addresses : undefined,
+                subject: draftSubject,
+                text: reply ? reply.text : text,
+                html: (reply ? reply.html : html) || undefined
+            };
+            if (reply?.inReplyTo) {
+                mail.inReplyTo = reply.inReplyTo;
+            }
+            if (reply?.references.length > 0) {
+                mail.references = reply.references;
+            }
+
+            const { raw, messageId } = await this.buildDraftMime(mail);
+
+            // Yahoo marks its drafts folder "Draft" with the \Drafts special-use attribute
+            const boxes = await client.getBoxes();
+            const draftsFolder = this.findSpecialUseFolder(boxes, '\\Drafts', ['Draft', 'Drafts']);
+            if (!draftsFolder) {
+                throw new Error('No Drafts folder found (no folder has the \\Drafts attribute or is named "Draft"/"Drafts"). Use list_folders to check.');
+            }
+
+            const draftUid = await client.append(raw, { mailbox: draftsFolder, flags: ['\\Draft', '\\Seen'] });
+
+            const result = {
+                success: true,
+                sent: false,
+                folder: draftsFolder,
+                uid: draftUid,
+                messageId: messageId,
+                from: email,
+                to: this.formatAddresses(draftTo),
+                cc: this.formatAddresses(draftCc),
+                bcc: this.formatAddresses(bcc.addresses),
+                subject: draftSubject,
+                account: account,
+                note: `Draft saved to "${draftsFolder}" only; nothing was sent. Review and send it from Yahoo Mail.`
+            };
+            if (reply) {
+                result.inReplyToUid = inReplyToUid;
+                result.sourceFolder = folder;
+                result.inReplyTo = reply.inReplyTo;
+                result.references = reply.references;
+                if (!reply.inReplyTo) {
+                    result.warning = 'Original email has no Message-ID header; the reply may not thread in mail clients.';
+                }
+            }
+
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(result, null, 2)
+                }]
+            };
+        } finally {
+            imap.end();
+        }
+    }
+
+    /**
+     * Helper: Extract threading Message-IDs from parsed headers (Imap.parseHeader output:
+     * lowercase keys, array values). The root is the first References entry, else In-Reply-To,
+     * else the message's own Message-ID. chain is capped at MAX_THREAD_SEARCH_IDS, keeping the root.
+     */
+    extractThreadIds(headers = {}) {
+        const idsOf = (field) => {
+            const value = [].concat(headers?.[field] || []).join(' ');
+            return value.match(/<[^<>\s]+>/g) || value.split(/\s+/).filter(Boolean);
+        };
+
+        const messageId = idsOf('message-id')[0] || null;
+        const inReplyTo = idsOf('in-reply-to')[0] || null;
+        const references = idsOf('references');
+        const rootId = references[0] || inReplyTo || messageId;
+
+        let chain = [...new Set([...references, inReplyTo, messageId].filter(Boolean))];
+        if (chain.length > MAX_THREAD_SEARCH_IDS) {
+            chain = [chain[0], ...chain.slice(-(MAX_THREAD_SEARCH_IDS - 1))];
+        }
+
+        return { messageId, inReplyTo, references, rootId, chain };
+    }
+
+    /**
+     * Helper: node-imap search criterion matching a thread: any Message-ID in the chain, or
+     * References/In-Reply-To containing the root (or the message itself). Terms are combined
+     * into a balanced OR tree to keep nesting shallow.
+     * @returns {Array|null} A single criterion (pass it as [criterion]), or null if there are no IDs
+     */
+    buildThreadSearchCriteria(threadIds) {
+        const { chain = [], rootId = null, messageId = null } = threadIds || {};
+
+        const terms = chain.map(id => ['HEADER', 'MESSAGE-ID', id]);
+        for (const id of new Set([rootId, messageId].filter(Boolean))) {
+            terms.push(['HEADER', 'REFERENCES', id]);
+            terms.push(['HEADER', 'IN-REPLY-TO', id]);
+        }
+
+        if (terms.length === 0) {
+            return null;
+        }
+
+        const combine = (list) => {
+            if (list.length === 1) {
+                return list[0];
+            }
+            const mid = Math.ceil(list.length / 2);
+            return ['OR', combine(list.slice(0, mid)), combine(list.slice(mid))];
+        };
+
+        return combine(terms);
+    }
+
+    /**
+     * Get the thread an email belongs to, searching its folder, INBOX and Sent
+     */
+    async getThread(uid, options = {}, account = 1) {
+        const { folder = 'INBOX' } = options;
+
+        // Validate input
+        const validationError = this.validateUID(uid);
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection(account);
+        const client = this.promisifyImap(imap);
+
+        try {
+            // 1. Threading headers of the requested email
+            await client.openBox(folder, true);  // true = read-only mode
+            const [target] = await client.fetch([uid], {
+                bodies: 'HEADER.FIELDS (MESSAGE-ID REFERENCES IN-REPLY-TO)'
+            });
+            if (!target) {
+                throw new Error(
+                    `UID not found: ${uid}. ` +
+                    `It may have been deleted or moved to another folder than "${folder}".`
+                );
+            }
+
+            const threadIds = this.extractThreadIds(Imap.parseHeader(target.raw.toString('utf8')));
+            const criteria = this.buildThreadSearchCriteria(threadIds);
+            const warnings = [];
+
+            // 2. Folders to search: the email's own folder first, then INBOX and Sent
+            const folders = [folder];
+            const isInbox = (name) => name.toUpperCase() === 'INBOX';
+            if (criteria) {
+                const sentFolder = this.findSpecialUseFolder(await client.getBoxes(), '\\Sent', ['Sent']);
+                if (!sentFolder) {
+                    warnings.push('No Sent folder found (no folder has the \\Sent attribute or is named "Sent"); your replies may be missing.');
+                }
+                for (const candidate of ['INBOX', sentFolder]) {
+                    if (candidate && !folders.some(f => f === candidate || (isInbox(f) && isInbox(candidate)))) {
+                        folders.push(candidate);
+                    }
+                }
+            } else {
+                warnings.push('Email has no Message-ID, References or In-Reply-To header; only the email itself is returned.');
+            }
+
+            // 3. Search and fetch each folder, de-duplicating by Message-ID
+            const seen = new Set();
+            const found = [];
+            const searched = [];
+            let truncated = false;
+
+            for (const current of folders) {
+                if (current !== folder) {
+                    try {
+                        await client.openBox(current, true);
+                    } catch (err) {
+                        warnings.push(err.message);
+                        continue;
+                    }
+                }
+                searched.push(current);
+
+                let uids = [];
+                if (criteria) {
+                    try {
+                        uids = await client.search([criteria]);
+                    } catch (err) {
+                        warnings.push(`Search failed in folder "${current}": ${err.message}`);
+                    }
+                }
+                if (current === folder && !uids.includes(uid)) {
+                    uids.push(uid);  // always include the requested email itself
+                }
+                uids = [...new Set(uids)].sort((a, b) => a - b);
+                if (uids.length > MAX_THREAD_MESSAGES) {
+                    truncated = true;
+                    uids = uids.slice(-MAX_THREAD_MESSAGES);
+                }
+                if (uids.length === 0) {
+                    continue;
+                }
+
+                for (const { raw, attrs } of await client.fetch(uids, { bodies: '' })) {
+                    const parsed = await simpleParser(raw);
+                    const key = parsed.messageId || `${current}\u0000${attrs.uid}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+
+                    let date = parsed.date instanceof Date && !isNaN(parsed.date) ? parsed.date : null;
+                    if (!date && attrs.date instanceof Date && !isNaN(attrs.date)) {
+                        date = attrs.date;  // fall back to INTERNALDATE
+                    }
+
+                    found.push({
+                        time: date ? date.getTime() : 0,
+                        message: {
+                            uid: attrs.uid,
+                            folder: current,
+                            from: parsed.from?.text || 'Unknown',
+                            to: parsed.to?.text || 'Unknown',
+                            date: date ? date.toISOString() : 'Unknown Date',
+                            subject: parsed.subject || 'No Subject',
+                            snippet: (parsed.text || '').replace(/\s+/g, ' ').trim().slice(0, THREAD_SNIPPET_LENGTH)
+                        }
+                    });
+                }
+            }
+
+            // Oldest first; keep the most recent MAX_THREAD_MESSAGES
+            found.sort((a, b) => a.time - b.time || a.message.uid - b.message.uid);
+            if (found.length > MAX_THREAD_MESSAGES) {
+                truncated = true;
+            }
+            const messages = found.slice(-MAX_THREAD_MESSAGES).map(f => f.message);
+
+            const result = {
+                uid: uid,
+                folder: folder,
+                messageId: threadIds.messageId,
+                rootMessageId: threadIds.rootId,
+                foldersSearched: searched,
+                count: messages.length,
+                truncated: truncated,
+                messages: messages
+            };
+            if (warnings.length > 0) {
+                result.warnings = warnings;
+            }
+
+            return {
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(result, null, 2)
+                }]
+            };
+        } finally {
+            imap.end();
+        }
     }
 
     setupErrorHandling() {
@@ -1343,13 +2984,238 @@ class YahooMailMCPServer {
         console.error('[Server] Email configured:', !!process.env.YAHOO_EMAIL);
         console.error('[Server] Password configured:', !!process.env.YAHOO_APP_PASSWORD);
 
+        // Refuse to start without OAuth credentials - the HTTP endpoints expose the mailbox
+        if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+            console.error('[Server] FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set in HTTP/SSE mode.');
+            console.error('[Server] Generate them with: openssl rand -hex 16 / openssl rand -hex 32');
+            process.exit(1);
+        }
+
+        // Optional owner-consent step on /oauth/authorize. Without it, anyone who knows the
+        // (public) client_id can start a flow and security rests on the client secret alone.
+        const approvalPassword = process.env.OAUTH_APPROVAL_PASSWORD || '';
+        if (!approvalPassword) {
+            console.error('[Server] WARNING: OAUTH_APPROVAL_PASSWORD is not set - /oauth/authorize approves every ' +
+                'request automatically. Set it to require an owner password before codes are issued.');
+        }
+
+        // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so req.ip is the client address
+        // from X-Forwarded-For instead of the proxy's. Never trusted unless explicitly configured.
+        const trustProxy = process.env.TRUST_PROXY;
+        // Only an integer hop count is accepted: `true` would trust a client-supplied
+        // X-Forwarded-For, letting anyone spoof their IP (or lock others out of the rate limit).
+        if (trustProxy && trustProxy !== 'false' && trustProxy !== '0') {
+            if (/^\d+$/.test(trustProxy)) {
+                app.set('trust proxy', Number(trustProxy));
+                console.error('[Server] trust proxy hops:', Number(trustProxy));
+            } else {
+                console.error(`[Server] WARNING: ignoring TRUST_PROXY=${JSON.stringify(trustProxy)} - it must be an ` +
+                    'integer hop count (e.g. 1). Trust proxy stays off.');
+            }
+        }
+
+        const { isInitializeRequest } = await import('@modelcontextprotocol/sdk/types.js');
+
+        // Security limits for in-memory OAuth/session state
+        const AUTH_CODE_TTL_MS = 10 * 60 * 1000;        // Authorization codes valid for 10 minutes
+        const TOKEN_TTL_SECONDS = 3600;                  // Access tokens valid for 1 hour
+        const SESSION_IDLE_MS = 60 * 60 * 1000;          // Streamable HTTP sessions expire after 1h idle
+        const MAX_AUTH_CODES = 1000;
+        const MAX_TOKENS = 10000;
+        const MAX_STREAMABLE_SESSIONS = 100;
+
+        // Access tokens: token -> expiry timestamp (ms)
+        this.validTokens = new Map();
+
+        // Generate an unguessable opaque token
+        const randomToken = () => crypto.randomBytes(32).toString('base64url');
+
+        // Issue and store a new access token with an expiry
+        const issueAccessToken = () => {
+            capMap(this.validTokens, MAX_TOKENS);
+            const token = randomToken();
+            this.validTokens.set(token, Date.now() + TOKEN_TTL_SECONDS * 1000);
+            return token;
+        };
+
+        // Constant-time string comparison
+        const safeEqual = (a, b) => {
+            if (typeof a !== 'string' || typeof b !== 'string') return false;
+            const bufA = Buffer.from(a);
+            const bufB = Buffer.from(b);
+            if (bufA.length !== bufB.length) return false;
+            return crypto.timingSafeEqual(bufA, bufB);
+        };
+
+        // Delete the oldest entries of a Map (insertion order) until it is below max
+        const capMap = (map, max) => {
+            for (const key of map.keys()) {
+                if (map.size < max) break;
+                map.delete(key);
+            }
+        };
+
+        // Fixed-window, per-IP rate limiter (in-memory). limit <= 0 disables it.
+        const parseLimit = (value, fallback) => {
+            if (value === undefined || value === '') return fallback;
+            const n = Number(value);
+            return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+        };
+        const RATE_LIMIT_WINDOW_MS = parseLimit(process.env.RATE_LIMIT_WINDOW_MS, 60 * 1000) || 60 * 1000;
+        const RATE_LIMIT_OAUTH = parseLimit(process.env.RATE_LIMIT_OAUTH_PER_MIN, 10);
+        const RATE_LIMIT_MCP = parseLimit(process.env.RATE_LIMIT_MCP_PER_MIN, 120);
+        const MAX_RATE_LIMIT_KEYS = 10000;
+
+        const createRateLimiter = (limit) => {
+            const hits = new Map(); // ip -> { count, resetAt }
+            if (limit > 0) {
+                const sweep = setInterval(() => {
+                    const now = Date.now();
+                    for (const [key, entry] of hits) {
+                        if (entry.resetAt <= now) hits.delete(key);
+                    }
+                }, RATE_LIMIT_WINDOW_MS);
+                sweep.unref();
+            }
+            return (req, res, next) => {
+                if (!(limit > 0)) return next();
+                const now = Date.now();
+                const key = req.ip || req.socket?.remoteAddress || 'unknown';
+                let entry = hits.get(key);
+                if (!entry || entry.resetAt <= now) {
+                    hits.delete(key);
+                    capMap(hits, MAX_RATE_LIMIT_KEYS);
+                    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+                    hits.set(key, entry);
+                }
+                entry.count++;
+                if (entry.count > limit) {
+                    const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+                    console.error('[RateLimit] Limit exceeded for', req.method, req.path);
+                    res.set('Retry-After', String(retryAfter));
+                    return res.status(429).json({
+                        error: 'too_many_requests',
+                        error_description: `Rate limit exceeded. Retry after ${retryAfter} seconds.`
+                    });
+                }
+                next();
+            };
+        };
+
+        // Separate buckets so MCP traffic cannot exhaust the OAuth budget (and vice versa)
+        const tokenRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);         // POST /oauth/token
+        const authorizeRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);     // GET /oauth/authorize
+        const consentRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);       // POST /oauth/authorize
+        const mcpRateLimit = createRateLimiter(RATE_LIMIT_MCP);
+
+        // Pending owner-consent requests: nonce -> validated authorize params (single use)
+        const CONSENT_TTL_MS = AUTH_CODE_TTL_MS;
+        const MAX_PENDING_CONSENTS = 100;
+        const MAX_APPROVAL_ATTEMPTS = 5;
+        const pendingConsents = new Map();
+
+        // Compare digests so neither content nor length of the password leaks through timing
+        const approvalPasswordDigest = crypto.createHash('sha256').update(approvalPassword).digest();
+        const checkApprovalPassword = (candidate) => {
+            if (typeof candidate !== 'string') return false;
+            const digest = crypto.createHash('sha256').update(candidate).digest();
+            return crypto.timingSafeEqual(digest, approvalPasswordDigest);
+        };
+
+        const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[c]);
+
+        const CONSENT_STYLE = 'body{font-family:system-ui,sans-serif;background:#f6f6f8;color:#1d1d1f;margin:0;' +
+            'padding:16px}main{max-width:420px;margin:40px auto;background:#fff;border-radius:12px;padding:24px;' +
+            'box-shadow:0 1px 4px rgba(0,0,0,.12)}h1{font-size:1.25rem;margin:0 0 12px}dt{font-weight:600;' +
+            'margin-top:8px}dd{margin:0;word-break:break-all}label{display:block;margin:16px 0 4px;font-weight:600}' +
+            'input[type=password]{width:100%;box-sizing:border-box;padding:8px;font-size:1rem}.actions{display:flex;' +
+            'gap:8px;margin-top:16px}button{flex:1;padding:10px;font-size:1rem;border-radius:8px;border:1px solid #888;' +
+            'cursor:pointer}button[value=approve]{background:#5f01d1;color:#fff;border-color:#5f01d1}' +
+            '.error{color:#b00020;font-weight:600}';
+        const CONSENT_STYLE_HASH = crypto.createHash('sha256').update(CONSENT_STYLE).digest('base64');
+
+        // Render the owner-consent page. Every reflected value is HTML-escaped and the CSP allows
+        // no scripts, no external loads and no framing.
+        const renderConsentPage = (res, nonce, pending, { status = 200, error } = {}) => {
+            const redirectUrl = new URL(pending.redirect_uri);
+            // Browsers apply form-action to the redirect that follows the POST, so allow its origin
+            const redirectSource = /^https?:$/.test(redirectUrl.protocol) ? redirectUrl.origin : redirectUrl.protocol;
+            const formAction = /^[a-z][a-z0-9+.-]*:(\/\/[A-Za-z0-9.:[\]-]+)?$/.test(redirectSource)
+                ? `form-action 'self' ${redirectSource}; ` : '';
+            res.status(status).set({
+                'Content-Type': 'text/html; charset=utf-8',
+                'Content-Security-Policy': `default-src 'none'; style-src 'sha256-${CONSENT_STYLE_HASH}'; ` +
+                    `${formAction}frame-ancestors 'none'; base-uri 'none'`,
+                'X-Frame-Options': 'DENY',
+                'X-Content-Type-Options': 'nosniff',
+                'Referrer-Policy': 'no-referrer',
+                'Cache-Control': 'no-store'
+            }).send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access</title>
+<style>${CONSENT_STYLE}</style>
+</head>
+<body>
+<main>
+<h1>Authorize access to Yahoo Mail</h1>
+<p>An application is asking for access to this mailbox through the MCP server. Approve only if you started this connection.</p>
+<dl>
+<dt>Client ID</dt><dd><code>${escapeHtml(pending.client_id)}</code></dd>
+<dt>Redirects to</dt><dd><code>${escapeHtml(redirectUrl.host || redirectUrl.protocol)}</code></dd>
+<dt>Scope</dt><dd><code>${escapeHtml(pending.scope || 'mcp')}</code></dd>
+</dl>
+${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
+<form method="post" action="/oauth/authorize">
+<input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+<label for="password">Owner approval password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+<div class="actions">
+<button type="submit" name="action" value="approve">Approve</button>
+<button type="submit" name="action" value="deny" formnovalidate>Deny</button>
+</div>
+</form>
+</main>
+</body>
+</html>`);
+        };
+
+        // Allowed OAuth redirect URIs: Claude.ai / Claude.com over https, loopback for local dev,
+        // plus exact URIs from OAUTH_ALLOWED_REDIRECT_URIS (comma-separated)
+        const extraRedirectUris = (process.env.OAUTH_ALLOWED_REDIRECT_URIS || '')
+            .split(',').map(s => s.trim()).filter(Boolean);
+        const isAllowedRedirectUri = (uri) => {
+            if (typeof uri !== 'string') return false;
+            if (extraRedirectUris.includes(uri)) return true;
+            let url;
+            try {
+                url = new URL(uri);
+            } catch {
+                return false;
+            }
+            if (url.username || url.password || url.hash) return false;
+            if (url.protocol === 'https:' && (url.hostname === 'claude.ai' || url.hostname === 'claude.com')) return true;
+            if ((url.protocol === 'http:' || url.protocol === 'https:') &&
+                (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')) return true;
+            return false;
+        };
+
+        // Allowed CORS origins (override with CORS_ALLOWED_ORIGINS, comma-separated)
+        const corsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://claude.ai,https://claude.com')
+            .split(',').map(s => s.trim()).filter(Boolean);
+
         // Enable CORS for Claude.ai and remote MCP connections
         app.use(cors({
-            origin: true,  // Allow all origins (Render's proxy may modify origin headers)
+            origin: (origin, callback) => callback(null, !origin || corsOrigins.includes(origin)),
             credentials: true,
-            methods: ['GET', 'POST', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-            exposedHeaders: ['Content-Type'],
+            methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With',
+                'Mcp-Session-Id', 'Mcp-Protocol-Version', 'Last-Event-ID'],
+            exposedHeaders: ['Content-Type', 'Mcp-Session-Id', 'WWW-Authenticate'],
             maxAge: 86400  // Cache preflight for 24 hours
         }));
 
@@ -1383,31 +3249,26 @@ class YahooMailMCPServer {
             next();
         });
 
-        // Authentication middleware for MCP endpoints
+        const getBaseUrl = (req) => `https://${req.get('host')}`;
+
+        // Authentication middleware - attached explicitly to every MCP route below
         const authenticateMCP = (req, res, next) => {
-            // Skip auth for health check, OAuth endpoints, discovery endpoints, and streamable HTTP
-            if (req.path === '/health' ||
-                req.path === '/' ||
-                req.path === '/mcp' ||
-                req.path.startsWith('/.well-known/') ||
-                req.path === '/register' ||
-                req.path.startsWith('/oauth/')) {
-                return next();
+            // Fail closed if OAuth is not configured
+            if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+                console.error('[Auth] OAuth not configured - refusing request');
+                return res.status(503).json({
+                    error: 'server_error',
+                    error_description: 'OAuth not configured on server'
+                });
             }
 
-            // Check if OAuth is configured
-            const oauthConfigured = process.env.OAUTH_CLIENT_ID && process.env.OAUTH_CLIENT_SECRET;
-
-            if (!oauthConfigured) {
-                console.error('[Auth] WARNING: OAuth not configured - server is UNSECURED!');
-                console.error('[Auth] Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to secure your server');
-                return next();
-            }
+            const resourceMetadata = `${getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp`;
 
             // Validate OAuth Bearer token
             const authHeader = req.headers.authorization;
             if (!authHeader || !authHeader.startsWith('Bearer ')) {
                 console.error('[Auth] Missing or invalid Authorization header');
+                res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}"`);
                 return res.status(401).json({
                     error: 'unauthorized',
                     error_description: 'Bearer token required'
@@ -1416,30 +3277,30 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token (must be known and unexpired)
+            const expiresAt = this.validTokens.get(token);
+            if (!expiresAt || expiresAt <= Date.now()) {
+                if (expiresAt) this.validTokens.delete(token);
                 console.error('[Auth] Invalid or expired access token');
+                res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}", error="invalid_token"`);
                 return res.status(401).json({
                     error: 'invalid_token',
                     error_description: 'The access token is invalid or has expired'
                 });
             }
 
-            console.error('[Auth] OAuth authentication successful');
             next();
         };
 
-        // Apply authentication to all MCP endpoints
-        app.use(authenticateMCP);
-
         // Helper function to generate OAuth metadata
         const getOAuthMetadata = (req) => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = getBaseUrl(req);
             return {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                // client_credentials skips the consent step, so it is only offered without a password
+                grant_types_supported: approvalPassword ? ['authorization_code'] : ['authorization_code', 'client_credentials'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -1449,7 +3310,7 @@ class YahooMailMCPServer {
 
         // Helper function to generate protected resource metadata
         const getProtectedResourceMetadata = (req, resourcePath = '') => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = getBaseUrl(req);
             return {
                 resource: resourcePath ? `${baseUrl}${resourcePath}` : baseUrl,
                 authorization_servers: [baseUrl],
@@ -1480,15 +3341,45 @@ class YahooMailMCPServer {
             res.json(getProtectedResourceMetadata(req));
         });
 
+        app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
+            console.error('[OAuth] Protected resource metadata for /mcp requested');
+            res.json(getProtectedResourceMetadata(req, '/mcp'));
+        });
+
         app.get('/.well-known/oauth-protected-resource/mcp/sse', (req, res) => {
             console.error('[OAuth] Protected resource metadata for /mcp/sse requested');
             res.json(getProtectedResourceMetadata(req, '/mcp/sse'));
         });
 
+        // Issue an authorization code for validated authorize params and redirect back to the client
+        const issueAuthCodeRedirect = (res, { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope }) => {
+            // Generate authorization code
+            const authCode = randomToken();
+
+            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
+            capMap(this.authCodes, MAX_AUTH_CODES);
+            this.authCodes.set(authCode, {
+                client_id,
+                redirect_uri,
+                code_challenge,
+                code_challenge_method,
+                scope,
+                created_at: Date.now()
+            });
+
+            console.error('[OAuth] Authorization code generated, redirecting to client');
+
+            // Redirect back to Claude with authorization code
+            const redirectUrl = new URL(redirect_uri);
+            redirectUrl.searchParams.append('code', authCode);
+            if (state) redirectUrl.searchParams.append('state', state);
+
+            res.redirect(redirectUrl.toString());
+        };
+
         // OAuth Authorization Endpoint (Authorization Code Flow)
-        app.get('/oauth/authorize', (req, res) => {
+        app.get('/oauth/authorize', authorizeRateLimit, (req, res) => {
             console.error('[OAuth] Authorization request received');
-            console.error('[OAuth] Query params:', JSON.stringify(req.query).substring(0, 200));
 
             const clientId = process.env.OAUTH_CLIENT_ID;
             const {
@@ -1513,38 +3404,80 @@ class YahooMailMCPServer {
                 return res.status(400).send('Unsupported response_type');
             }
 
-            // Validate redirect_uri (must be Claude's callback)
-            if (!redirect_uri || (!redirect_uri.includes('claude.ai') && !redirect_uri.includes('claude.com') && !redirect_uri.includes('localhost'))) {
-                console.error('[OAuth] Invalid redirect_uri:', redirect_uri);
+            // Validate redirect_uri (must be Claude's callback, loopback, or explicitly allowlisted)
+            if (!isAllowedRedirectUri(redirect_uri)) {
+                console.error('[OAuth] Rejected redirect_uri');
                 return res.status(400).send('Invalid redirect_uri');
             }
 
-            // Generate authorization code
-            const authCode = Buffer.from(`${client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+            // Require PKCE with S256
+            if (typeof code_challenge !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(code_challenge) ||
+                code_challenge_method !== 'S256') {
+                console.error('[OAuth] Missing or unsupported PKCE code_challenge');
+                return res.status(400).send('PKCE code_challenge with code_challenge_method=S256 is required');
+            }
 
-            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            if (!this.authCodes) this.authCodes = new Map();
-            this.authCodes.set(authCode, {
-                client_id,
-                redirect_uri,
-                code_challenge,
-                code_challenge_method,
-                scope,
-                created_at: Date.now()
-            });
+            const params = { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope };
 
-            console.error('[OAuth] Authorization code generated, redirecting to:', redirect_uri);
+            // No owner password configured: approve automatically (see startup warning)
+            if (!approvalPassword) {
+                return issueAuthCodeRedirect(res, params);
+            }
 
-            // Redirect back to Claude with authorization code
-            const redirectUrl = new URL(redirect_uri);
-            redirectUrl.searchParams.append('code', authCode);
-            if (state) redirectUrl.searchParams.append('state', state);
+            // Hold the validated request server-side, keyed by a single-use nonce that the
+            // consent form must echo back (CSRF protection), and ask the owner to approve
+            const nonce = randomToken();
+            capMap(pendingConsents, MAX_PENDING_CONSENTS);
+            pendingConsents.set(nonce, { ...params, created_at: Date.now(), attempts: 0 });
+            console.error('[OAuth] Awaiting owner approval');
+            renderConsentPage(res, nonce, params);
+        });
 
-            res.redirect(redirectUrl.toString());
+        // Owner-consent form submission (only when OAUTH_APPROVAL_PASSWORD is set)
+        app.post('/oauth/authorize', consentRateLimit, express.urlencoded({ extended: false, limit: '10kb' }), (req, res) => {
+            if (!approvalPassword) {
+                return res.status(404).send('Not found');
+            }
+
+            const { nonce, action, password } = req.body || {};
+            const pending = typeof nonce === 'string' ? pendingConsents.get(nonce) : undefined;
+            if (!pending || Date.now() - pending.created_at > CONSENT_TTL_MS) {
+                if (pending) pendingConsents.delete(nonce);
+                console.error('[OAuth] Consent submission with unknown or expired nonce');
+                return res.status(400).send('Authorization request is invalid or has expired. Start again from your client.');
+            }
+
+            if (action === 'deny') {
+                pendingConsents.delete(nonce);
+                console.error('[OAuth] Owner denied authorization request');
+                const redirectUrl = new URL(pending.redirect_uri);
+                redirectUrl.searchParams.append('error', 'access_denied');
+                if (pending.state) redirectUrl.searchParams.append('state', pending.state);
+                return res.redirect(redirectUrl.toString());
+            }
+
+            if (action !== 'approve') {
+                return res.status(400).send('Invalid action');
+            }
+
+            if (!checkApprovalPassword(password)) {
+                pending.attempts++;
+                console.error('[OAuth] Owner approval failed - wrong password');
+                if (pending.attempts >= MAX_APPROVAL_ATTEMPTS) {
+                    pendingConsents.delete(nonce);
+                    return res.status(400).send('Too many failed attempts. Start again from your client.');
+                }
+                return renderConsentPage(res, nonce, pending, { status: 401, error: 'Incorrect password.' });
+            }
+
+            // Approved: consume the nonce and issue the code exactly as the automatic flow does
+            pendingConsents.delete(nonce);
+            console.error('[OAuth] Owner approved authorization request');
+            issueAuthCodeRedirect(res, pending);
         });
 
         // OAuth Token Endpoint (supports both Authorization Code and Client Credentials flows)
-        app.post('/oauth/token', async (req, res) => {
+        app.post('/oauth/token', tokenRateLimit, async (req, res) => {
             console.error('[OAuth] Token request - grant type:', req.body?.grant_type || 'unknown');
 
             const clientId = process.env.OAUTH_CLIENT_ID;
@@ -1564,14 +3497,20 @@ class YahooMailMCPServer {
 
             if (authHeader && authHeader.startsWith('Basic ')) {
                 const credentials = Buffer.from(authHeader.substring(6), 'base64').toString();
-                [reqClientId, reqClientSecret] = credentials.split(':');
+                const sep = credentials.indexOf(':');
+                if (sep !== -1) {
+                    reqClientId = credentials.substring(0, sep);
+                    reqClientSecret = credentials.substring(sep + 1);
+                }
             } else {
                 reqClientId = req.body?.client_id;
                 reqClientSecret = req.body?.client_secret;
             }
 
-            // Validate credentials
-            if (reqClientId !== clientId || reqClientSecret !== clientSecret) {
+            // Validate credentials (constant-time)
+            const idOk = safeEqual(reqClientId, clientId);
+            const secretOk = safeEqual(reqClientSecret, clientSecret);
+            if (!idOk || !secretOk) {
                 console.error('[OAuth] Authentication failed - invalid client credentials');
                 return res.status(401).json({
                     error: 'invalid_client',
@@ -1587,59 +3526,78 @@ class YahooMailMCPServer {
 
                 console.error('[OAuth] Authorization code grant - validating code');
 
-                // Validate authorization code
-                if (!this.authCodes || !this.authCodes.has(code)) {
-                    console.error('[OAuth] Invalid or expired authorization code');
+                const invalidGrant = (description) => {
+                    console.error('[OAuth] Authorization code grant rejected:', description);
                     return res.status(400).json({
                         error: 'invalid_grant',
-                        error_description: 'Invalid or expired authorization code'
+                        error_description: description
                     });
+                };
+
+                // Validate authorization code
+                if (typeof code !== 'string' || !this.authCodes.has(code)) {
+                    return invalidGrant('Invalid or expired authorization code');
                 }
 
                 const authData = this.authCodes.get(code);
 
-                // Validate PKCE code verifier
-                if (authData.code_challenge) {
-                    const crypto = await import('crypto');
-                    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-                    if (hash !== authData.code_challenge) {
-                        console.error('[OAuth] PKCE validation failed');
-                        return res.status(400).json({
-                            error: 'invalid_grant',
-                            error_description: 'PKCE validation failed'
-                        });
-                    }
-                }
-
-                // Delete used auth code (one-time use)
+                // Delete auth code immediately (single use, even if validation below fails)
                 this.authCodes.delete(code);
 
+                if (Date.now() - authData.created_at > AUTH_CODE_TTL_MS) {
+                    return invalidGrant('Invalid or expired authorization code');
+                }
+
+                if (authData.client_id !== reqClientId) {
+                    return invalidGrant('Authorization code was issued to a different client');
+                }
+
+                // redirect_uri must match the one bound to the code
+                if (redirect_uri !== authData.redirect_uri) {
+                    return invalidGrant('redirect_uri does not match authorization request');
+                }
+
+                // Validate PKCE code verifier (S256 is required at authorization time)
+                if (typeof code_verifier !== 'string' || !/^[A-Za-z0-9._~-]{43,128}$/.test(code_verifier)) {
+                    return invalidGrant('Missing or malformed code_verifier');
+                }
+                const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+                if (!safeEqual(hash, authData.code_challenge)) {
+                    return invalidGrant('PKCE validation failed');
+                }
+
                 // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = issueAccessToken();
 
                 console.error('[OAuth] Access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: TOKEN_TTL_SECONDS,
                     scope: authData.scope || 'mcp'
                 });
             }
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
+                // This grant never passes through the owner-consent form, so it would bypass
+                // OAUTH_APPROVAL_PASSWORD. Refuse it whenever that password is configured.
+                if (approvalPassword) {
+                    return res.status(400).json({
+                        error: 'unauthorized_client',
+                        error_description: 'client_credentials is disabled while OAUTH_APPROVAL_PASSWORD is set; use authorization_code'
+                    });
+                }
                 // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = issueAccessToken();
 
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: TOKEN_TTL_SECONDS,
                     scope: 'mcp'
                 });
             }
@@ -1666,7 +3624,7 @@ class YahooMailMCPServer {
             res.json({
                 status: 'ok',
                 service: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '4.0.0',
                 timestamp: new Date().toISOString(),
                 environment: {
                     nodeVersion: process.version,
@@ -1679,7 +3637,7 @@ class YahooMailMCPServer {
         });
 
         // SSE endpoint for MCP
-        app.get('/mcp/sse', async (req, res) => {
+        app.get('/mcp/sse', mcpRateLimit, authenticateMCP, async (req, res) => {
             try {
                 console.error('[SSE] New connection established from:', req.ip);
                 console.error('[SSE] Origin:', req.headers.origin);
@@ -1700,7 +3658,12 @@ class YahooMailMCPServer {
                     this.transports.delete(sessionId);
                 };
 
-                await this.server.connect(transport);
+                // A fresh Server per connection: SDK >=1.32 rejects connecting one Server to
+                // multiple transports, and sharing one leaks responses across clients
+                // (GHSA-345p-7cg4-v4c7). createStreamableServer is defined below in runSSE()
+                // and is initialized before any request can arrive.
+                const sessionServer = createStreamableServer();
+                await sessionServer.connect(transport);
                 console.error('[SSE] MCP server connected to transport');
             } catch (error) {
                 console.error('[SSE] Error connecting transport:', error);
@@ -1711,29 +3674,32 @@ class YahooMailMCPServer {
         });
 
         // Message endpoint for SSE
-        app.post('/mcp/message', async (req, res) => {
+        app.post('/mcp/message', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[SSE] Received message on /mcp/message');
             console.error('[SSE] Active transports:', this.transports.size);
 
             // Extract session ID from query or headers (body not parsed yet)
             const sessionId = req.query?.sessionId || req.headers['x-session-id'];
-            console.error('[SSE] Session ID from request:', sessionId);
 
-            if (sessionId && this.transports.has(sessionId)) {
-                const transport = this.transports.get(sessionId);
-                console.error('[SSE] Routing message to transport:', sessionId);
+            if (!sessionId || typeof sessionId !== 'string') {
+                console.error('[SSE] Missing session ID');
+                return res.status(400).json({ error: 'Missing sessionId' });
+            }
+
+            if (!this.transports.has(sessionId)) {
+                console.error('[SSE] Unknown session ID');
+                return res.status(404).json({ error: 'Session not found' });
+            }
+
+            const transport = this.transports.get(sessionId);
+            console.error('[SSE] Routing message to transport:', sessionId);
+            try {
                 // Let the transport handle the message
-                transport.handlePostMessage(req, res);
-            } else {
-                // If no session ID or transport not found, try the first available transport
-                // (for backwards compatibility with single-connection scenario)
-                const firstTransport = Array.from(this.transports.values())[0];
-                if (firstTransport) {
-                    console.error('[SSE] No session ID, using first available transport');
-                    firstTransport.handlePostMessage(req, res);
-                } else {
-                    console.error('[SSE] No active transport found');
-                    res.status(404).json({ error: 'No active SSE connection found' });
+                await transport.handlePostMessage(req, res);
+            } catch (error) {
+                console.error('[SSE] Error handling message:', error);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Internal server error' });
                 }
             }
         });
@@ -1747,13 +3713,13 @@ class YahooMailMCPServer {
         // Store streamable HTTP transports by session ID
         const streamableTransports = new Map();
 
-        // Helper: create a new MCP server instance for streamable HTTP sessions
+        // Helper: create a new MCP server instance per session (Streamable HTTP and legacy SSE)
         const self = this;
         const createStreamableServer = () => {
             const server = new Server(
                 {
                     name: 'yahoo-mail-mcp',
-                    version: '3.0.0',
+                    version: '4.0.0',
                 },
                 {
                     capabilities: {
@@ -1772,27 +3738,91 @@ class YahooMailMCPServer {
                 return await self.handleToolCall(name, args);
             });
 
+            server.onerror = (error) => {
+                console.error('[MCP Error]', error);
+            };
+
             return server;
         };
 
-        app.post('/mcp', async (req, res) => {
-            console.error('[Streamable HTTP] POST /mcp received');
+        // JSON-RPC error response helper
+        const sendJsonRpcError = (res, status, code, message) => {
+            res.status(status).json({
+                jsonrpc: '2.0',
+                error: { code, message },
+                id: null
+            });
+        };
+
+        // Look up a streamable session by header and mark it active
+        // Returns the transport, or sends 400 (missing) / 404 (unknown) and returns null
+        const getStreamableSession = (req, res) => {
             const sessionId = req.headers['mcp-session-id'];
-            console.error('[Streamable HTTP] Session ID from header:', sessionId);
+            if (!sessionId) {
+                sendJsonRpcError(res, 400, -32000, 'Bad Request: Mcp-Session-Id header is required');
+                return null;
+            }
+            const entry = streamableTransports.get(sessionId);
+            if (!entry) {
+                sendJsonRpcError(res, 404, -32001, 'Session not found');
+                return null;
+            }
+            entry.lastSeen = Date.now();
+            return entry.transport;
+        };
+
+        // Run a transport request, converting thrown errors into a 500 instead of crashing
+        const handleStreamable = async (transport, req, res, body) => {
+            try {
+                await transport.handleRequest(req, res, body);
+            } catch (error) {
+                console.error('[Streamable HTTP] Error handling request:', error);
+                if (!res.headersSent) {
+                    sendJsonRpcError(res, 500, -32603, 'Internal server error');
+                }
+            }
+        };
+
+        const closeStreamableSession = (id) => {
+            const entry = streamableTransports.get(id);
+            if (!entry) return;
+            streamableTransports.delete(id);
+            entry.transport.close().catch((error) => {
+                console.error('[Streamable HTTP] Error closing session:', error);
+            });
+        };
+
+        app.post('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
+            console.error('[Streamable HTTP] POST /mcp received');
 
             let transport;
 
-            if (sessionId && streamableTransports.has(sessionId)) {
+            if (req.headers['mcp-session-id']) {
                 // Existing session
-                transport = streamableTransports.get(sessionId);
-            } else if (!sessionId) {
+                transport = getStreamableSession(req, res);
+                if (!transport) return;
+            } else if (isInitializeRequest(req.body)) {
                 // New session - create transport and server
                 console.error('[Streamable HTTP] Creating new session');
+
+                // Cap concurrent sessions: evict the least recently used one
+                if (streamableTransports.size >= MAX_STREAMABLE_SESSIONS) {
+                    let oldestId = null;
+                    let oldestSeen = Infinity;
+                    for (const [id, entry] of streamableTransports) {
+                        if (entry.lastSeen < oldestSeen) {
+                            oldestSeen = entry.lastSeen;
+                            oldestId = id;
+                        }
+                    }
+                    if (oldestId) closeStreamableSession(oldestId);
+                }
+
                 transport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => crypto.randomUUID(),
                     onsessioninitialized: (id) => {
                         console.error('[Streamable HTTP] Session initialized:', id);
-                        streamableTransports.set(id, transport);
+                        streamableTransports.set(id, { transport, lastSeen: Date.now() });
                     },
                     onsessionclosed: (id) => {
                         console.error('[Streamable HTTP] Session closed:', id);
@@ -1800,50 +3830,69 @@ class YahooMailMCPServer {
                     }
                 });
 
-                // Connect to a new server instance
-                const server = createStreamableServer();
-                await server.connect(transport);
+                transport.onclose = () => {
+                    if (transport.sessionId) streamableTransports.delete(transport.sessionId);
+                };
+
+                try {
+                    // Connect to a new server instance
+                    const server = createStreamableServer();
+                    await server.connect(transport);
+                } catch (error) {
+                    console.error('[Streamable HTTP] Error creating session:', error);
+                    return sendJsonRpcError(res, 500, -32603, 'Internal server error');
+                }
             } else {
-                // Invalid session ID
-                console.error('[Streamable HTTP] Invalid session ID:', sessionId);
-                res.status(404).json({ error: 'Session not found' });
-                return;
+                console.error('[Streamable HTTP] Non-initialize request without session ID');
+                return sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
             }
 
-            await transport.handleRequest(req, res, req.body);
+            await handleStreamable(transport, req, res, req.body);
         });
 
-        app.get('/mcp', async (req, res) => {
+        app.get('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] GET /mcp (SSE stream)');
-            const sessionId = req.headers['mcp-session-id'];
-
-            if (sessionId && streamableTransports.has(sessionId)) {
-                const transport = streamableTransports.get(sessionId);
-                await transport.handleRequest(req, res);
-            } else {
-                res.status(400).json({ error: 'Invalid or missing session ID' });
-            }
+            const transport = getStreamableSession(req, res);
+            if (!transport) return;
+            await handleStreamable(transport, req, res);
         });
 
-        app.delete('/mcp', async (req, res) => {
+        app.delete('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] DELETE /mcp (session close)');
             const sessionId = req.headers['mcp-session-id'];
-
-            if (sessionId && streamableTransports.has(sessionId)) {
-                const transport = streamableTransports.get(sessionId);
-                await transport.handleRequest(req, res);
-                streamableTransports.delete(sessionId);
-            } else {
-                res.status(404).json({ error: 'Session not found' });
-            }
+            const transport = getStreamableSession(req, res);
+            if (!transport) return;
+            await handleStreamable(transport, req, res);
+            streamableTransports.delete(sessionId);
         });
+
+        // Periodically purge expired auth codes/tokens/consents and idle streamable sessions
+        const sweepInterval = setInterval(() => {
+            const now = Date.now();
+            for (const [code, data] of this.authCodes) {
+                if (now - data.created_at > AUTH_CODE_TTL_MS) this.authCodes.delete(code);
+            }
+            for (const [nonce, pending] of pendingConsents) {
+                if (now - pending.created_at > CONSENT_TTL_MS) pendingConsents.delete(nonce);
+            }
+            for (const [token, expiresAt] of this.validTokens) {
+                if (expiresAt <= now) this.validTokens.delete(token);
+            }
+            for (const [id, entry] of streamableTransports) {
+                if (now - entry.lastSeen > SESSION_IDLE_MS) {
+                    console.error('[Streamable HTTP] Expiring idle session:', id);
+                    closeStreamableSession(id);
+                }
+            }
+        }, 5 * 60 * 1000);
+        sweepInterval.unref();
 
         // Error handling middleware
         app.use((err, req, res, next) => {
             console.error('[Express] Error:', err);
-            res.status(500).json({
-                error: 'Internal server error',
-                message: err.message
+            const status = err.status || err.statusCode || 500;
+            res.status(status >= 400 && status < 500 ? status : 500).json({
+                error: status >= 400 && status < 500 ? 'Bad request' : 'Internal server error'
             });
         });
 
@@ -1851,7 +3900,7 @@ class YahooMailMCPServer {
         app.get('/', (req, res) => {
             res.json({
                 name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
+                version: '4.0.0',
                 description: 'MCP server for Yahoo Mail access via IMAP',
                 endpoints: {
                     health: '/health',
@@ -1868,7 +3917,14 @@ class YahooMailMCPServer {
                     'mark_as_unread',
                     'flag_emails',
                     'unflag_emails',
-                    'move_emails'
+                    'move_emails',
+                    'list_folders',
+                    'send_email',
+                    'reply_email',
+                    'save_draft',
+                    'get_thread',
+                    'get_attachments',
+                    'get_mailbox_stats'
                 ]
             });
         });
@@ -1881,6 +3937,18 @@ class YahooMailMCPServer {
     }
 }
 
-// Start the server
-const server = new YahooMailMCPServer();
-server.run().catch(console.error);
+export { YahooMailMCPServer };
+
+// Start the server only when run directly (`node server.js`), not when imported (e.g. by tests)
+const isEntryPoint = (() => {
+    try {
+        return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+})();
+
+if (isEntryPoint) {
+    const server = new YahooMailMCPServer();
+    server.run().catch(console.error);
+}
