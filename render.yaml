@@ -28,6 +28,10 @@ services:
         sync: false  # Set this in Render Dashboard (Settings > Environment)
       - key: YAHOO_APP_PASSWORD
         sync: false  # Set this in Render Dashboard (Settings > Environment)
+      - key: OAUTH_CLIENT_ID
+        sync: false  # REQUIRED - server refuses to start without it (openssl rand -hex 16)
+      - key: OAUTH_CLIENT_SECRET
+        sync: false  # REQUIRED - server refuses to start without it (openssl rand -hex 32)
 
     # Health check configuration
     healthCheckPath: /health

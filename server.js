@@ -2115,13 +2115,86 @@ class YahooMailMCPServer {
         console.error('[Server] Email configured:', !!process.env.YAHOO_EMAIL);
         console.error('[Server] Password configured:', !!process.env.YAHOO_APP_PASSWORD);
 
+        // Refuse to start without OAuth credentials - the HTTP endpoints expose the mailbox
+        if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+            console.error('[Server] FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set in HTTP/SSE mode.');
+            console.error('[Server] Generate them with: openssl rand -hex 16 / openssl rand -hex 32');
+            process.exit(1);
+        }
+
+        const { isInitializeRequest } = await import('@modelcontextprotocol/sdk/types.js');
+
+        // Security limits for in-memory OAuth/session state
+        const AUTH_CODE_TTL_MS = 10 * 60 * 1000;        // Authorization codes valid for 10 minutes
+        const TOKEN_TTL_SECONDS = 3600;                  // Access tokens valid for 1 hour
+        const SESSION_IDLE_MS = 60 * 60 * 1000;          // Streamable HTTP sessions expire after 1h idle
+        const MAX_AUTH_CODES = 1000;
+        const MAX_TOKENS = 10000;
+        const MAX_STREAMABLE_SESSIONS = 100;
+
+        // Access tokens: token -> expiry timestamp (ms)
+        this.validTokens = new Map();
+
+        // Generate an unguessable opaque token
+        const randomToken = () => crypto.randomBytes(32).toString('base64url');
+
+        // Issue and store a new access token with an expiry
+        const issueAccessToken = () => {
+            capMap(this.validTokens, MAX_TOKENS);
+            const token = randomToken();
+            this.validTokens.set(token, Date.now() + TOKEN_TTL_SECONDS * 1000);
+            return token;
+        };
+
+        // Constant-time string comparison
+        const safeEqual = (a, b) => {
+            if (typeof a !== 'string' || typeof b !== 'string') return false;
+            const bufA = Buffer.from(a);
+            const bufB = Buffer.from(b);
+            if (bufA.length !== bufB.length) return false;
+            return crypto.timingSafeEqual(bufA, bufB);
+        };
+
+        // Delete the oldest entries of a Map (insertion order) until it is below max
+        const capMap = (map, max) => {
+            for (const key of map.keys()) {
+                if (map.size < max) break;
+                map.delete(key);
+            }
+        };
+
+        // Allowed OAuth redirect URIs: Claude.ai / Claude.com over https, loopback for local dev,
+        // plus exact URIs from OAUTH_ALLOWED_REDIRECT_URIS (comma-separated)
+        const extraRedirectUris = (process.env.OAUTH_ALLOWED_REDIRECT_URIS || '')
+            .split(',').map(s => s.trim()).filter(Boolean);
+        const isAllowedRedirectUri = (uri) => {
+            if (typeof uri !== 'string') return false;
+            if (extraRedirectUris.includes(uri)) return true;
+            let url;
+            try {
+                url = new URL(uri);
+            } catch {
+                return false;
+            }
+            if (url.username || url.password || url.hash) return false;
+            if (url.protocol === 'https:' && (url.hostname === 'claude.ai' || url.hostname === 'claude.com')) return true;
+            if ((url.protocol === 'http:' || url.protocol === 'https:') &&
+                (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]')) return true;
+            return false;
+        };
+
+        // Allowed CORS origins (override with CORS_ALLOWED_ORIGINS, comma-separated)
+        const corsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://claude.ai,https://claude.com')
+            .split(',').map(s => s.trim()).filter(Boolean);
+
         // Enable CORS for Claude.ai and remote MCP connections
         app.use(cors({
-            origin: true,  // Allow all origins (Render's proxy may modify origin headers)
+            origin: (origin, callback) => callback(null, !origin || corsOrigins.includes(origin)),
             credentials: true,
-            methods: ['GET', 'POST', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-            exposedHeaders: ['Content-Type'],
+            methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With',
+                'Mcp-Session-Id', 'Mcp-Protocol-Version', 'Last-Event-ID'],
+            exposedHeaders: ['Content-Type', 'Mcp-Session-Id', 'WWW-Authenticate'],
             maxAge: 86400  // Cache preflight for 24 hours
         }));
 
@@ -2155,31 +2228,26 @@ class YahooMailMCPServer {
             next();
         });
 
-        // Authentication middleware for MCP endpoints
+        const getBaseUrl = (req) => `https://${req.get('host')}`;
+
+        // Authentication middleware - attached explicitly to every MCP route below
         const authenticateMCP = (req, res, next) => {
-            // Skip auth for health check, OAuth endpoints, discovery endpoints, and streamable HTTP
-            if (req.path === '/health' ||
-                req.path === '/' ||
-                req.path === '/mcp' ||
-                req.path.startsWith('/.well-known/') ||
-                req.path === '/register' ||
-                req.path.startsWith('/oauth/')) {
-                return next();
+            // Fail closed if OAuth is not configured
+            if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+                console.error('[Auth] OAuth not configured - refusing request');
+                return res.status(503).json({
+                    error: 'server_error',
+                    error_description: 'OAuth not configured on server'
+                });
             }
 
-            // Check if OAuth is configured
-            const oauthConfigured = process.env.OAUTH_CLIENT_ID && process.env.OAUTH_CLIENT_SECRET;
-
-            if (!oauthConfigured) {
-                console.error('[Auth] WARNING: OAuth not configured - server is UNSECURED!');
-                console.error('[Auth] Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to secure your server');
-                return next();
-            }
+            const resourceMetadata = `${getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp`;
 
             // Validate OAuth Bearer token
             const authHeader = req.headers.authorization;
             if (!authHeader || !authHeader.startsWith('Bearer ')) {
                 console.error('[Auth] Missing or invalid Authorization header');
+                res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}"`);
                 return res.status(401).json({
                     error: 'unauthorized',
                     error_description: 'Bearer token required'
@@ -2188,25 +2256,24 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
+            // Validate token (must be known and unexpired)
+            const expiresAt = this.validTokens.get(token);
+            if (!expiresAt || expiresAt <= Date.now()) {
+                if (expiresAt) this.validTokens.delete(token);
                 console.error('[Auth] Invalid or expired access token');
+                res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadata}", error="invalid_token"`);
                 return res.status(401).json({
                     error: 'invalid_token',
                     error_description: 'The access token is invalid or has expired'
                 });
             }
 
-            console.error('[Auth] OAuth authentication successful');
             next();
         };
 
-        // Apply authentication to all MCP endpoints
-        app.use(authenticateMCP);
-
         // Helper function to generate OAuth metadata
         const getOAuthMetadata = (req) => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = getBaseUrl(req);
             return {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
@@ -2221,7 +2288,7 @@ class YahooMailMCPServer {
 
         // Helper function to generate protected resource metadata
         const getProtectedResourceMetadata = (req, resourcePath = '') => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = getBaseUrl(req);
             return {
                 resource: resourcePath ? `${baseUrl}${resourcePath}` : baseUrl,
                 authorization_servers: [baseUrl],
@@ -2252,6 +2319,11 @@ class YahooMailMCPServer {
             res.json(getProtectedResourceMetadata(req));
         });
 
+        app.get('/.well-known/oauth-protected-resource/mcp', (req, res) => {
+            console.error('[OAuth] Protected resource metadata for /mcp requested');
+            res.json(getProtectedResourceMetadata(req, '/mcp'));
+        });
+
         app.get('/.well-known/oauth-protected-resource/mcp/sse', (req, res) => {
             console.error('[OAuth] Protected resource metadata for /mcp/sse requested');
             res.json(getProtectedResourceMetadata(req, '/mcp/sse'));
@@ -2260,7 +2332,6 @@ class YahooMailMCPServer {
         // OAuth Authorization Endpoint (Authorization Code Flow)
         app.get('/oauth/authorize', (req, res) => {
             console.error('[OAuth] Authorization request received');
-            console.error('[OAuth] Query params:', JSON.stringify(req.query).substring(0, 200));
 
             const clientId = process.env.OAUTH_CLIENT_ID;
             const {
@@ -2285,17 +2356,24 @@ class YahooMailMCPServer {
                 return res.status(400).send('Unsupported response_type');
             }
 
-            // Validate redirect_uri (must be Claude's callback)
-            if (!redirect_uri || (!redirect_uri.includes('claude.ai') && !redirect_uri.includes('claude.com') && !redirect_uri.includes('localhost'))) {
-                console.error('[OAuth] Invalid redirect_uri:', redirect_uri);
+            // Validate redirect_uri (must be Claude's callback, loopback, or explicitly allowlisted)
+            if (!isAllowedRedirectUri(redirect_uri)) {
+                console.error('[OAuth] Rejected redirect_uri');
                 return res.status(400).send('Invalid redirect_uri');
             }
 
+            // Require PKCE with S256
+            if (typeof code_challenge !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(code_challenge) ||
+                code_challenge_method !== 'S256') {
+                console.error('[OAuth] Missing or unsupported PKCE code_challenge');
+                return res.status(400).send('PKCE code_challenge with code_challenge_method=S256 is required');
+            }
+
             // Generate authorization code
-            const authCode = Buffer.from(`${client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+            const authCode = randomToken();
 
             // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            if (!this.authCodes) this.authCodes = new Map();
+            capMap(this.authCodes, MAX_AUTH_CODES);
             this.authCodes.set(authCode, {
                 client_id,
                 redirect_uri,
@@ -2305,7 +2383,7 @@ class YahooMailMCPServer {
                 created_at: Date.now()
             });
 
-            console.error('[OAuth] Authorization code generated, redirecting to:', redirect_uri);
+            console.error('[OAuth] Authorization code generated, redirecting to client');
 
             // Redirect back to Claude with authorization code
             const redirectUrl = new URL(redirect_uri);
@@ -2336,14 +2414,20 @@ class YahooMailMCPServer {
 
             if (authHeader && authHeader.startsWith('Basic ')) {
                 const credentials = Buffer.from(authHeader.substring(6), 'base64').toString();
-                [reqClientId, reqClientSecret] = credentials.split(':');
+                const sep = credentials.indexOf(':');
+                if (sep !== -1) {
+                    reqClientId = credentials.substring(0, sep);
+                    reqClientSecret = credentials.substring(sep + 1);
+                }
             } else {
                 reqClientId = req.body?.client_id;
                 reqClientSecret = req.body?.client_secret;
             }
 
-            // Validate credentials
-            if (reqClientId !== clientId || reqClientSecret !== clientSecret) {
+            // Validate credentials (constant-time)
+            const idOk = safeEqual(reqClientId, clientId);
+            const secretOk = safeEqual(reqClientSecret, clientSecret);
+            if (!idOk || !secretOk) {
                 console.error('[OAuth] Authentication failed - invalid client credentials');
                 return res.status(401).json({
                     error: 'invalid_client',
@@ -2359,43 +2443,55 @@ class YahooMailMCPServer {
 
                 console.error('[OAuth] Authorization code grant - validating code');
 
-                // Validate authorization code
-                if (!this.authCodes || !this.authCodes.has(code)) {
-                    console.error('[OAuth] Invalid or expired authorization code');
+                const invalidGrant = (description) => {
+                    console.error('[OAuth] Authorization code grant rejected:', description);
                     return res.status(400).json({
                         error: 'invalid_grant',
-                        error_description: 'Invalid or expired authorization code'
+                        error_description: description
                     });
+                };
+
+                // Validate authorization code
+                if (typeof code !== 'string' || !this.authCodes.has(code)) {
+                    return invalidGrant('Invalid or expired authorization code');
                 }
 
                 const authData = this.authCodes.get(code);
 
-                // Validate PKCE code verifier
-                if (authData.code_challenge) {
-                    const crypto = await import('crypto');
-                    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-                    if (hash !== authData.code_challenge) {
-                        console.error('[OAuth] PKCE validation failed');
-                        return res.status(400).json({
-                            error: 'invalid_grant',
-                            error_description: 'PKCE validation failed'
-                        });
-                    }
-                }
-
-                // Delete used auth code (one-time use)
+                // Delete auth code immediately (single use, even if validation below fails)
                 this.authCodes.delete(code);
 
+                if (Date.now() - authData.created_at > AUTH_CODE_TTL_MS) {
+                    return invalidGrant('Invalid or expired authorization code');
+                }
+
+                if (authData.client_id !== reqClientId) {
+                    return invalidGrant('Authorization code was issued to a different client');
+                }
+
+                // redirect_uri must match the one bound to the code
+                if (redirect_uri !== authData.redirect_uri) {
+                    return invalidGrant('redirect_uri does not match authorization request');
+                }
+
+                // Validate PKCE code verifier (S256 is required at authorization time)
+                if (typeof code_verifier !== 'string' || !/^[A-Za-z0-9._~-]{43,128}$/.test(code_verifier)) {
+                    return invalidGrant('Missing or malformed code_verifier');
+                }
+                const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+                if (!safeEqual(hash, authData.code_challenge)) {
+                    return invalidGrant('PKCE validation failed');
+                }
+
                 // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = issueAccessToken();
 
                 console.error('[OAuth] Access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: TOKEN_TTL_SECONDS,
                     scope: authData.scope || 'mcp'
                 });
             }
@@ -2403,15 +2499,14 @@ class YahooMailMCPServer {
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
                 // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = issueAccessToken();
 
                 console.error('[OAuth] Access token generated via client credentials');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
-                    expires_in: 3600,
+                    expires_in: TOKEN_TTL_SECONDS,
                     scope: 'mcp'
                 });
             }
@@ -2451,7 +2546,7 @@ class YahooMailMCPServer {
         });
 
         // SSE endpoint for MCP
-        app.get('/mcp/sse', async (req, res) => {
+        app.get('/mcp/sse', authenticateMCP, async (req, res) => {
             try {
                 console.error('[SSE] New connection established from:', req.ip);
                 console.error('[SSE] Origin:', req.headers.origin);
@@ -2488,29 +2583,32 @@ class YahooMailMCPServer {
         });
 
         // Message endpoint for SSE
-        app.post('/mcp/message', async (req, res) => {
+        app.post('/mcp/message', authenticateMCP, async (req, res) => {
             console.error('[SSE] Received message on /mcp/message');
             console.error('[SSE] Active transports:', this.transports.size);
 
             // Extract session ID from query or headers (body not parsed yet)
             const sessionId = req.query?.sessionId || req.headers['x-session-id'];
-            console.error('[SSE] Session ID from request:', sessionId);
 
-            if (sessionId && this.transports.has(sessionId)) {
-                const transport = this.transports.get(sessionId);
-                console.error('[SSE] Routing message to transport:', sessionId);
+            if (!sessionId || typeof sessionId !== 'string') {
+                console.error('[SSE] Missing session ID');
+                return res.status(400).json({ error: 'Missing sessionId' });
+            }
+
+            if (!this.transports.has(sessionId)) {
+                console.error('[SSE] Unknown session ID');
+                return res.status(404).json({ error: 'Session not found' });
+            }
+
+            const transport = this.transports.get(sessionId);
+            console.error('[SSE] Routing message to transport:', sessionId);
+            try {
                 // Let the transport handle the message
-                transport.handlePostMessage(req, res);
-            } else {
-                // If no session ID or transport not found, try the first available transport
-                // (for backwards compatibility with single-connection scenario)
-                const firstTransport = Array.from(this.transports.values())[0];
-                if (firstTransport) {
-                    console.error('[SSE] No session ID, using first available transport');
-                    firstTransport.handlePostMessage(req, res);
-                } else {
-                    console.error('[SSE] No active transport found');
-                    res.status(404).json({ error: 'No active SSE connection found' });
+                await transport.handlePostMessage(req, res);
+            } catch (error) {
+                console.error('[SSE] Error handling message:', error);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Internal server error' });
                 }
             }
         });
@@ -2556,24 +2654,84 @@ class YahooMailMCPServer {
             return server;
         };
 
-        app.post('/mcp', async (req, res) => {
-            console.error('[Streamable HTTP] POST /mcp received');
+        // JSON-RPC error response helper
+        const sendJsonRpcError = (res, status, code, message) => {
+            res.status(status).json({
+                jsonrpc: '2.0',
+                error: { code, message },
+                id: null
+            });
+        };
+
+        // Look up a streamable session by header and mark it active
+        // Returns the transport, or sends 400 (missing) / 404 (unknown) and returns null
+        const getStreamableSession = (req, res) => {
             const sessionId = req.headers['mcp-session-id'];
-            console.error('[Streamable HTTP] Session ID from header:', sessionId);
+            if (!sessionId) {
+                sendJsonRpcError(res, 400, -32000, 'Bad Request: Mcp-Session-Id header is required');
+                return null;
+            }
+            const entry = streamableTransports.get(sessionId);
+            if (!entry) {
+                sendJsonRpcError(res, 404, -32001, 'Session not found');
+                return null;
+            }
+            entry.lastSeen = Date.now();
+            return entry.transport;
+        };
+
+        // Run a transport request, converting thrown errors into a 500 instead of crashing
+        const handleStreamable = async (transport, req, res, body) => {
+            try {
+                await transport.handleRequest(req, res, body);
+            } catch (error) {
+                console.error('[Streamable HTTP] Error handling request:', error);
+                if (!res.headersSent) {
+                    sendJsonRpcError(res, 500, -32603, 'Internal server error');
+                }
+            }
+        };
+
+        const closeStreamableSession = (id) => {
+            const entry = streamableTransports.get(id);
+            if (!entry) return;
+            streamableTransports.delete(id);
+            entry.transport.close().catch((error) => {
+                console.error('[Streamable HTTP] Error closing session:', error);
+            });
+        };
+
+        app.post('/mcp', authenticateMCP, async (req, res) => {
+            console.error('[Streamable HTTP] POST /mcp received');
 
             let transport;
 
-            if (sessionId && streamableTransports.has(sessionId)) {
+            if (req.headers['mcp-session-id']) {
                 // Existing session
-                transport = streamableTransports.get(sessionId);
-            } else if (!sessionId) {
+                transport = getStreamableSession(req, res);
+                if (!transport) return;
+            } else if (isInitializeRequest(req.body)) {
                 // New session - create transport and server
                 console.error('[Streamable HTTP] Creating new session');
+
+                // Cap concurrent sessions: evict the least recently used one
+                if (streamableTransports.size >= MAX_STREAMABLE_SESSIONS) {
+                    let oldestId = null;
+                    let oldestSeen = Infinity;
+                    for (const [id, entry] of streamableTransports) {
+                        if (entry.lastSeen < oldestSeen) {
+                            oldestSeen = entry.lastSeen;
+                            oldestId = id;
+                        }
+                    }
+                    if (oldestId) closeStreamableSession(oldestId);
+                }
+
                 transport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => crypto.randomUUID(),
                     onsessioninitialized: (id) => {
                         console.error('[Streamable HTTP] Session initialized:', id);
-                        streamableTransports.set(id, transport);
+                        streamableTransports.set(id, { transport, lastSeen: Date.now() });
                     },
                     onsessionclosed: (id) => {
                         console.error('[Streamable HTTP] Session closed:', id);
@@ -2581,50 +2739,66 @@ class YahooMailMCPServer {
                     }
                 });
 
-                // Connect to a new server instance
-                const server = createStreamableServer();
-                await server.connect(transport);
+                transport.onclose = () => {
+                    if (transport.sessionId) streamableTransports.delete(transport.sessionId);
+                };
+
+                try {
+                    // Connect to a new server instance
+                    const server = createStreamableServer();
+                    await server.connect(transport);
+                } catch (error) {
+                    console.error('[Streamable HTTP] Error creating session:', error);
+                    return sendJsonRpcError(res, 500, -32603, 'Internal server error');
+                }
             } else {
-                // Invalid session ID
-                console.error('[Streamable HTTP] Invalid session ID:', sessionId);
-                res.status(404).json({ error: 'Session not found' });
-                return;
+                console.error('[Streamable HTTP] Non-initialize request without session ID');
+                return sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
             }
 
-            await transport.handleRequest(req, res, req.body);
+            await handleStreamable(transport, req, res, req.body);
         });
 
-        app.get('/mcp', async (req, res) => {
+        app.get('/mcp', authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] GET /mcp (SSE stream)');
-            const sessionId = req.headers['mcp-session-id'];
-
-            if (sessionId && streamableTransports.has(sessionId)) {
-                const transport = streamableTransports.get(sessionId);
-                await transport.handleRequest(req, res);
-            } else {
-                res.status(400).json({ error: 'Invalid or missing session ID' });
-            }
+            const transport = getStreamableSession(req, res);
+            if (!transport) return;
+            await handleStreamable(transport, req, res);
         });
 
-        app.delete('/mcp', async (req, res) => {
+        app.delete('/mcp', authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] DELETE /mcp (session close)');
             const sessionId = req.headers['mcp-session-id'];
-
-            if (sessionId && streamableTransports.has(sessionId)) {
-                const transport = streamableTransports.get(sessionId);
-                await transport.handleRequest(req, res);
-                streamableTransports.delete(sessionId);
-            } else {
-                res.status(404).json({ error: 'Session not found' });
-            }
+            const transport = getStreamableSession(req, res);
+            if (!transport) return;
+            await handleStreamable(transport, req, res);
+            streamableTransports.delete(sessionId);
         });
+
+        // Periodically purge expired auth codes/tokens and idle streamable sessions
+        const sweepInterval = setInterval(() => {
+            const now = Date.now();
+            for (const [code, data] of this.authCodes) {
+                if (now - data.created_at > AUTH_CODE_TTL_MS) this.authCodes.delete(code);
+            }
+            for (const [token, expiresAt] of this.validTokens) {
+                if (expiresAt <= now) this.validTokens.delete(token);
+            }
+            for (const [id, entry] of streamableTransports) {
+                if (now - entry.lastSeen > SESSION_IDLE_MS) {
+                    console.error('[Streamable HTTP] Expiring idle session:', id);
+                    closeStreamableSession(id);
+                }
+            }
+        }, 5 * 60 * 1000);
+        sweepInterval.unref();
 
         // Error handling middleware
         app.use((err, req, res, next) => {
             console.error('[Express] Error:', err);
-            res.status(500).json({
-                error: 'Internal server error',
-                message: err.message
+            const status = err.status || err.statusCode || 500;
+            res.status(status >= 400 && status < 500 ? status : 500).json({
+                error: status >= 400 && status < 500 ? 'Bad request' : 'Internal server error'
             });
         });
 
