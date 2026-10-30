@@ -521,7 +521,9 @@ class YahooMailMCPServer {
      */
     async handleToolCall(name, args) {
         try {
-            const account = args?.account || 1;
+            // Strict: the SDK doesn't validate inputSchema, so "2" or 3 must not silently fall back to account 1
+            const account = Number(args?.account ?? 1);
+            if (account !== 1 && account !== 2) throw new Error('account must be 1 or 2');
             switch (name) {
                     case 'list_emails':
                         return await this.listEmails(args?.count || 10, args?.folder || 'INBOX', args?.offset || 0, account);
@@ -601,7 +603,8 @@ class YahooMailMCPServer {
                             type: 'text',
                             text: `Error: ${error.message}`
                         }
-                    ]
+                    ],
+                    isError: true
                 };
             }
     }
@@ -626,6 +629,11 @@ class YahooMailMCPServer {
      */
     async createImapConnection(account = 1) {
         return new Promise((resolve, reject) => {
+            account = Number(account);
+            if (account !== 1 && account !== 2) {
+                reject(new Error('account must be 1 or 2'));
+                return;
+            }
             const emailVar = account === 2 ? 'YAHOO_EMAIL_2' : 'YAHOO_EMAIL';
             const passVar = account === 2 ? 'YAHOO_APP_PASSWORD_2' : 'YAHOO_APP_PASSWORD';
             const email = process.env[emailVar];
@@ -699,16 +707,78 @@ class YahooMailMCPServer {
     }
 
     /**
+     * Run an IMAP operation on a fresh connection. executor(imap, resolve, reject) has the
+     * shape of a Promise executor. The call settles even if the connection errors or closes
+     * mid-operation (node-imap has no socket timeout), or after timeoutMs, and the connection
+     * is always closed afterwards.
+     */
+    async withImap(account, executor, timeoutMs = 60000) {
+        const imap = await this.createImapConnection(account);
+
+        // Make end() idempotent and remember that a close after it is expected
+        let ending = false;
+        const end = imap.end.bind(imap);
+        imap.end = () => {
+            if (ending) return;
+            ending = true;
+            end();
+        };
+
+        const destroy = () => {
+            if (imap.state === 'disconnected') return;
+            try {
+                imap.destroy();
+                imap._sock?.destroy();
+            } catch (e) {
+                console.error('[IMAP] Failed to destroy connection:', e.message);
+            }
+        };
+
+        let timer;
+        let broken = false;
+        const guard = new Promise((_, reject) => {
+            const fail = (message) => {
+                broken = true;
+                reject(new Error(message));
+            };
+            imap.on('error', (err) => fail(`IMAP connection error: ${err.message}`));
+            imap.once('close', () => {
+                if (!ending) fail('IMAP connection closed before the operation completed');
+            });
+            timer = setTimeout(() => fail(`IMAP operation timed out after ${timeoutMs / 1000}s`), timeoutMs);
+        });
+        const operation = new Promise((resolve, reject) => executor(imap, resolve, reject));
+
+        try {
+            return await Promise.race([operation, guard]);
+        } finally {
+            clearTimeout(timer);
+            if (broken) {
+                destroy();
+            } else {
+                imap.end();
+                // Don't let a server that never answers LOGOUT keep the socket open
+                setTimeout(destroy, 10000).unref();
+            }
+        }
+    }
+
+    /**
      * List recent emails with enriched metadata
      */
     async listEmails(count = 10, folder = 'INBOX', offset = 0, account = 1) {
+        count = Number(count);
+        offset = Number(offset);
+        folder = this.sanitizeText(folder, 'folder');
+
         // Validate count parameter
-        if (count < 1) {
+        if (!Number.isInteger(count) || count < 1) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: count must be at least 1'
-                }]
+                }],
+                isError: true
             };
         }
 
@@ -717,23 +787,23 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: 'Error: count cannot exceed 50 (use search or filters for larger results)'
-                }]
+                }],
+                isError: true
             };
         }
 
         // Validate offset
-        if (offset < 0) {
+        if (!Number.isInteger(offset) || offset < 0) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: offset must be non-negative'
-                }]
+                }],
+                isError: true
             };
         }
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -765,7 +835,8 @@ class YahooMailMCPServer {
                 const startSeq = Math.max(1, total - offset - count + 1);
                 const endSeq = Math.max(1, total - offset);
 
-                if (startSeq > endSeq) {
+                // Paging past the end must return nothing (the range math would clamp to message 1)
+                if (offset >= total || startSeq > endSeq) {
                     imap.end();
                     resolve({
                         content: [{
@@ -786,18 +857,19 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let header = '';
+                    const chunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            header += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -806,7 +878,7 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        const parsed = Imap.parseHeader(header);
+                        const parsed = Imap.parseHeader(Buffer.concat(chunks).toString('utf8'));
 
                         emails.push({
                             uid: attrs.uid,                          // NEW: Permanent UID
@@ -865,7 +937,7 @@ class YahooMailMCPServer {
      * Search emails with advanced filters
      */
     async searchEmails(query, options = {}, account = 1) {
-        const {
+        let {
             count = 10,
             dateFrom = null,
             dateTo = null,
@@ -880,23 +952,43 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: 'Error: query is required (use empty string "" for searches without text criteria)'
-                }]
+                }],
+                isError: true
             };
         }
 
+        // Validate/coerce everything BEFORE connecting: a bad type would otherwise throw
+        // inside a node-imap callback and kill the process, and CR/LF allows IMAP injection
+        query = this.sanitizeText(query, 'query');
+        sender = this.sanitizeText(sender, 'sender');
+        folder = this.sanitizeText(folder, 'folder');
+        count = Number(count);
+        // An unparseable date must fail loudly, not silently drop the filter (e.g. before a bulk delete)
+        const sinceDate = dateFrom ? this.toImapSearchDate(dateFrom, 'dateFrom', false) : null;
+        const beforeDate = dateTo ? this.toImapSearchDate(dateTo, 'dateTo', true) : null;
+
         // Validate count parameter
-        if (count < 1) {
+        if (!Number.isInteger(count) || count < 1) {
             return {
                 content: [{
                     type: 'text',
                     text: 'Error: count must be at least 1'
-                }]
+                }],
+                isError: true
             };
         }
 
-        const imap = await this.createImapConnection(account);
+        if (count > 50) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Error: count cannot exceed 50 (narrow the search with filters)'
+                }],
+                isError: true
+            };
+        }
 
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -921,31 +1013,13 @@ class YahooMailMCPServer {
                     criteria.push(['HEADER', 'FROM', sender]);
                 }
 
-                // Date range filters
-                if (dateFrom) {
-                    try {
-                        const fromDate = new Date(dateFrom);
-                        if (!isNaN(fromDate.getTime())) {
-                            criteria.push(['SINCE', fromDate]);
-                        }
-                    } catch (e) {
-                        imap.end();
-                        reject(new Error(`Invalid dateFrom format: ${dateFrom}. Use ISO 8601 format.`));
-                        return;
-                    }
+                // Date range filters (validated before connecting; dateTo is inclusive)
+                if (sinceDate) {
+                    criteria.push(['SINCE', sinceDate]);
                 }
 
-                if (dateTo) {
-                    try {
-                        const toDate = new Date(dateTo);
-                        if (!isNaN(toDate.getTime())) {
-                            criteria.push(['BEFORE', toDate]);
-                        }
-                    } catch (e) {
-                        imap.end();
-                        reject(new Error(`Invalid dateTo format: ${dateTo}. Use ISO 8601 format.`));
-                        return;
-                    }
+                if (beforeDate) {
+                    criteria.push(['BEFORE', beforeDate]);
                 }
 
                 // Unread only filter
@@ -989,18 +1063,19 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                        size: true
                     });
 
                     const emails = [];
 
                     fetch.on('message', (msg, seqno) => {
-                        let header = '';
+                        const chunks = [];
                         let attrs = null;
 
                         msg.on('body', (stream, info) => {
                             stream.on('data', (chunk) => {
-                                header += chunk.toString('ascii');
+                                chunks.push(chunk);
                             });
                         });
 
@@ -1009,7 +1084,7 @@ class YahooMailMCPServer {
                         });
 
                         msg.once('end', () => {
-                            const parsed = Imap.parseHeader(header);
+                            const parsed = Imap.parseHeader(Buffer.concat(chunks).toString('utf8'));
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,
@@ -1089,13 +1164,13 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
+        folder = this.sanitizeText(folder, 'folder');
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, false, (err, box) => {  // false = read-write mode
                 if (err) {
                     imap.end();
@@ -1105,11 +1180,12 @@ class YahooMailMCPServer {
 
                 const successfulUIDs = [];
                 const failedUIDs = [];
+                const existingUIDs = [];
                 let processedCount = 0;
 
                 // Process each UID individually to ensure all are processed
                 const processNextUID = () => {
-                    if (processedCount >= uids.length) {
+                    if (processedCount >= existingUIDs.length) {
                         // All UIDs processed
                         imap.end();
 
@@ -1135,7 +1211,7 @@ class YahooMailMCPServer {
                         return;
                     }
 
-                    const uid = uids[processedCount];
+                    const uid = existingUIDs[processedCount];
                     processedCount++;
 
                     // Execute the UID-based operation for this single UID
@@ -1152,8 +1228,28 @@ class YahooMailMCPServer {
                     });
                 };
 
-                // Start processing
-                processNextUID();
+                // UID STORE/MOVE return OK for UIDs that don't exist, so look them up first:
+                // missing UIDs are reported as failed and only existing ones are acted on
+                imap.search([['UID', uids.join(',')]], (err, found) => {
+                    if (err) {
+                        imap.end();
+                        reject(new Error(`Failed to look up UIDs in "${folder}": ${err.message}`));
+                        return;
+                    }
+
+                    const foundSet = new Set(found || []);
+                    for (const uid of uids) {
+                        if (foundSet.has(uid)) {
+                            existingUIDs.push(uid);
+                        } else {
+                            console.error(`[UID ${uid}] Not found in "${folder}"; skipped`);
+                            failedUIDs.push(uid);
+                        }
+                    }
+
+                    // Start processing
+                    processNextUID();
+                });
             });
         });
     }
@@ -1169,13 +1265,13 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
+        folder = this.sanitizeText(folder, 'folder');
 
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {  // true = read-only mode
                 if (err) {
                     imap.end();
@@ -1183,24 +1279,28 @@ class YahooMailMCPServer {
                     return;
                 }
 
-                const source = uids.join(',');
+                // Pass the array: a joined "1,2,3" string is parseInt'd by node-imap to just the first UID
+                const source = uids;
 
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parseJobs = [];
+                const parseErrors = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];  // raw bytes: decoding chunks individually corrupts non-ASCII bodies
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
+                            chunks.push(chunk);
                         });
                     });
 
@@ -1210,12 +1310,9 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
+                        // Parsing is async: collect the promises so fetch 'end' can wait for them.
+                        // keepCidLinks stops inline images being embedded into the html as data: URIs.
+                        parseJobs.push(simpleParser(Buffer.concat(chunks), { keepCidLinks: true }).then((parsed) => {
                             emails.push({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,  // Still include for reference
@@ -1226,9 +1323,12 @@ class YahooMailMCPServer {
                                 size: attrs.size || 0,
                                 flags: attrs.flags || [],
                                 hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
+                                content: this.extractBodyText(parsed)
                             });
-                        });
+                        }).catch((err) => {
+                            console.error(`[UID ${attrs?.uid}] Error parsing email:`, err);
+                            parseErrors.push({ uid: attrs?.uid, message: err.message });
+                        }));
                     });
                 });
 
@@ -1237,8 +1337,11 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+
+                    // 'end' fires before the async parses finish; wait for them (each job catches its own error)
+                    await Promise.all(parseJobs);
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
@@ -1268,10 +1371,21 @@ class YahooMailMCPServer {
                         `${email.content}`
                     ).join('\n\n' + '='.repeat(80) + '\n\n');
 
+                    // Surface per-UID parse failures instead of silently dropping those emails
+                    const parseErrorText = parseErrors
+                        .map(e => `Failed to parse email UID ${e.uid}: ${e.message}`)
+                        .join('\n');
+                    if (emails.length === 0 && parseErrors.length > 0) {
+                        reject(new Error(parseErrorText));
+                        return;
+                    }
+
                     resolve({
                         content: [{
                             type: 'text',
-                            text: emailContent
+                            text: parseErrorText
+                                ? `${emailContent}\n\n${'='.repeat(80)}\n\n${parseErrorText}`
+                                : emailContent
                         }]
                     });
                 });
@@ -1361,6 +1475,10 @@ class YahooMailMCPServer {
      * Move emails to a specific folder
      */
     async moveEmails(uids, folderName, sourceFolder = 'INBOX', account = 1) {
+        if (folderName === undefined || folderName === null || folderName === '') {
+            throw new Error('folderName is required');
+        }
+        folderName = this.sanitizeText(folderName, 'folderName');
         return this.modifyEmails(
             uids,
             (imap, source, callback) => imap.move(source, folderName, callback),  // NO .seq
@@ -1381,7 +1499,7 @@ class YahooMailMCPServer {
             if (!part) return false;
 
             // Check if this part is an attachment
-            if (part.disposition && part.disposition.type === 'attachment') {
+            if (part.disposition && String(part.disposition.type).toLowerCase() === 'attachment') {
                 return true;
             }
 
@@ -1394,6 +1512,61 @@ class YahooMailMCPServer {
         };
 
         return checkPart(struct);
+    }
+
+    /**
+     * Helper: Coerce a text argument to a string and reject CR/LF/NUL, which would let
+     * the value inject raw IMAP commands. null/undefined pass through unchanged.
+     */
+    sanitizeText(value, name) {
+        if (value === undefined || value === null) return value;
+        const str = String(value);
+        if (/[\r\n\0]/.test(str)) {
+            throw new Error(`${name} must not contain line breaks or NUL characters`);
+        }
+        return str;
+    }
+
+    /**
+     * Helper: Convert a user date to the Date node-imap needs for SINCE/BEFORE.
+     * Throws on unparseable input. node-imap formats search dates with local-time getters,
+     * so rebuild from UTC components to keep the calendar date the caller meant.
+     * isTo makes the end date inclusive (BEFORE the following day).
+     */
+    toImapSearchDate(value, name, isTo) {
+        const d = new Date(value);
+        if (isNaN(d.getTime())) {
+            throw new Error(`Invalid ${name}: "${value}". Use ISO 8601 format (e.g. 2024-01-31).`);
+        }
+        return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + (isTo ? 1 : 0));
+    }
+
+    /**
+     * Helper: Plain-text body of a parsed email, bounded in size. Prefers the text part;
+     * otherwise strips tags from the html.
+     */
+    extractBodyText(parsed, maxChars = 20000) {
+        let body = parsed.text;
+        if (!body && parsed.html) {
+            body = parsed.html
+                .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
+                .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6])>/gi, '\n')
+                .replace(/<[^>]*>/g, '')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&lt;/gi, '<')
+                .replace(/&gt;/gi, '>')
+                .replace(/&quot;/gi, '"')
+                .replace(/&#39;/gi, "'")
+                .replace(/&amp;/gi, '&')
+                .replace(/[ \t]+/g, ' ')
+                .replace(/\n\s*\n\s*\n+/g, '\n\n')
+                .trim();
+        }
+        if (!body) return 'No content available';
+        if (body.length > maxChars) {
+            body = `${body.slice(0, maxChars)}\n\n[truncated: showing first ${maxChars} of ${body.length} characters]`;
+        }
+        return body;
     }
 
     /**
@@ -1459,9 +1632,7 @@ class YahooMailMCPServer {
      * List all available IMAP folders
      */
     async listFolders(account = 1) {
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.getBoxes((err, boxes) => {
                 imap.end();
 
