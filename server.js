@@ -2308,6 +2308,23 @@ class YahooMailMCPServer {
             process.exit(1);
         }
 
+        // Optional owner-consent step on /oauth/authorize. Without it, anyone who knows the
+        // (public) client_id can start a flow and security rests on the client secret alone.
+        const approvalPassword = process.env.OAUTH_APPROVAL_PASSWORD || '';
+        if (!approvalPassword) {
+            console.error('[Server] WARNING: OAUTH_APPROVAL_PASSWORD is not set - /oauth/authorize approves every ' +
+                'request automatically. Set it to require an owner password before codes are issued.');
+        }
+
+        // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so req.ip is the client address
+        // from X-Forwarded-For instead of the proxy's. Never trusted unless explicitly configured.
+        const trustProxy = process.env.TRUST_PROXY;
+        if (trustProxy && trustProxy !== 'false') {
+            const value = /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy === 'true' ? true : trustProxy;
+            app.set('trust proxy', value);
+            console.error('[Server] trust proxy:', value);
+        }
+
         const { isInitializeRequest } = await import('@modelcontextprotocol/sdk/types.js');
 
         // Security limits for in-memory OAuth/session state
@@ -2347,6 +2364,135 @@ class YahooMailMCPServer {
                 if (map.size < max) break;
                 map.delete(key);
             }
+        };
+
+        // Fixed-window, per-IP rate limiter (in-memory). limit <= 0 disables it.
+        const parseLimit = (value, fallback) => {
+            if (value === undefined || value === '') return fallback;
+            const n = Number(value);
+            return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+        };
+        const RATE_LIMIT_WINDOW_MS = parseLimit(process.env.RATE_LIMIT_WINDOW_MS, 60 * 1000) || 60 * 1000;
+        const RATE_LIMIT_OAUTH = parseLimit(process.env.RATE_LIMIT_OAUTH_PER_MIN, 10);
+        const RATE_LIMIT_MCP = parseLimit(process.env.RATE_LIMIT_MCP_PER_MIN, 120);
+        const MAX_RATE_LIMIT_KEYS = 10000;
+
+        const createRateLimiter = (limit) => {
+            const hits = new Map(); // ip -> { count, resetAt }
+            if (limit > 0) {
+                const sweep = setInterval(() => {
+                    const now = Date.now();
+                    for (const [key, entry] of hits) {
+                        if (entry.resetAt <= now) hits.delete(key);
+                    }
+                }, RATE_LIMIT_WINDOW_MS);
+                sweep.unref();
+            }
+            return (req, res, next) => {
+                if (!(limit > 0)) return next();
+                const now = Date.now();
+                const key = req.ip || req.socket?.remoteAddress || 'unknown';
+                let entry = hits.get(key);
+                if (!entry || entry.resetAt <= now) {
+                    hits.delete(key);
+                    capMap(hits, MAX_RATE_LIMIT_KEYS);
+                    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+                    hits.set(key, entry);
+                }
+                entry.count++;
+                if (entry.count > limit) {
+                    const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+                    console.error('[RateLimit] Limit exceeded for', req.method, req.path);
+                    res.set('Retry-After', String(retryAfter));
+                    return res.status(429).json({
+                        error: 'too_many_requests',
+                        error_description: `Rate limit exceeded. Retry after ${retryAfter} seconds.`
+                    });
+                }
+                next();
+            };
+        };
+
+        // Separate buckets so MCP traffic cannot exhaust the OAuth budget (and vice versa)
+        const tokenRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);         // POST /oauth/token
+        const authorizeRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);     // GET /oauth/authorize
+        const consentRateLimit = createRateLimiter(RATE_LIMIT_OAUTH);       // POST /oauth/authorize
+        const mcpRateLimit = createRateLimiter(RATE_LIMIT_MCP);
+
+        // Pending owner-consent requests: nonce -> validated authorize params (single use)
+        const CONSENT_TTL_MS = AUTH_CODE_TTL_MS;
+        const MAX_PENDING_CONSENTS = 100;
+        const MAX_APPROVAL_ATTEMPTS = 5;
+        const pendingConsents = new Map();
+
+        // Compare digests so neither content nor length of the password leaks through timing
+        const approvalPasswordDigest = crypto.createHash('sha256').update(approvalPassword).digest();
+        const checkApprovalPassword = (candidate) => {
+            if (typeof candidate !== 'string') return false;
+            const digest = crypto.createHash('sha256').update(candidate).digest();
+            return crypto.timingSafeEqual(digest, approvalPasswordDigest);
+        };
+
+        const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[c]);
+
+        const CONSENT_STYLE = 'body{font-family:system-ui,sans-serif;background:#f6f6f8;color:#1d1d1f;margin:0;' +
+            'padding:16px}main{max-width:420px;margin:40px auto;background:#fff;border-radius:12px;padding:24px;' +
+            'box-shadow:0 1px 4px rgba(0,0,0,.12)}h1{font-size:1.25rem;margin:0 0 12px}dt{font-weight:600;' +
+            'margin-top:8px}dd{margin:0;word-break:break-all}label{display:block;margin:16px 0 4px;font-weight:600}' +
+            'input[type=password]{width:100%;box-sizing:border-box;padding:8px;font-size:1rem}.actions{display:flex;' +
+            'gap:8px;margin-top:16px}button{flex:1;padding:10px;font-size:1rem;border-radius:8px;border:1px solid #888;' +
+            'cursor:pointer}button[value=approve]{background:#5f01d1;color:#fff;border-color:#5f01d1}' +
+            '.error{color:#b00020;font-weight:600}';
+        const CONSENT_STYLE_HASH = crypto.createHash('sha256').update(CONSENT_STYLE).digest('base64');
+
+        // Render the owner-consent page. Every reflected value is HTML-escaped and the CSP allows
+        // no scripts, no external loads and no framing.
+        const renderConsentPage = (res, nonce, pending, { status = 200, error } = {}) => {
+            const redirectUrl = new URL(pending.redirect_uri);
+            // Browsers apply form-action to the redirect that follows the POST, so allow its origin
+            const redirectSource = /^https?:$/.test(redirectUrl.protocol) ? redirectUrl.origin : redirectUrl.protocol;
+            const formAction = /^[a-z][a-z0-9+.-]*:(\/\/[A-Za-z0-9.:[\]-]+)?$/.test(redirectSource)
+                ? `form-action 'self' ${redirectSource}; ` : '';
+            res.status(status).set({
+                'Content-Type': 'text/html; charset=utf-8',
+                'Content-Security-Policy': `default-src 'none'; style-src 'sha256-${CONSENT_STYLE_HASH}'; ` +
+                    `${formAction}frame-ancestors 'none'; base-uri 'none'`,
+                'X-Frame-Options': 'DENY',
+                'X-Content-Type-Options': 'nosniff',
+                'Referrer-Policy': 'no-referrer',
+                'Cache-Control': 'no-store'
+            }).send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize access</title>
+<style>${CONSENT_STYLE}</style>
+</head>
+<body>
+<main>
+<h1>Authorize access to Yahoo Mail</h1>
+<p>An application is asking for access to this mailbox through the MCP server. Approve only if you started this connection.</p>
+<dl>
+<dt>Client ID</dt><dd><code>${escapeHtml(pending.client_id)}</code></dd>
+<dt>Redirects to</dt><dd><code>${escapeHtml(redirectUrl.host || redirectUrl.protocol)}</code></dd>
+<dt>Scope</dt><dd><code>${escapeHtml(pending.scope || 'mcp')}</code></dd>
+</dl>
+${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
+<form method="post" action="/oauth/authorize">
+<input type="hidden" name="nonce" value="${escapeHtml(nonce)}">
+<label for="password">Owner approval password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+<div class="actions">
+<button type="submit" name="action" value="approve">Approve</button>
+<button type="submit" name="action" value="deny" formnovalidate>Deny</button>
+</div>
+</form>
+</main>
+</body>
+</html>`);
         };
 
         // Allowed OAuth redirect URIs: Claude.ai / Claude.com over https, loopback for local dev,
@@ -2515,8 +2661,34 @@ class YahooMailMCPServer {
             res.json(getProtectedResourceMetadata(req, '/mcp/sse'));
         });
 
+        // Issue an authorization code for validated authorize params and redirect back to the client
+        const issueAuthCodeRedirect = (res, { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope }) => {
+            // Generate authorization code
+            const authCode = randomToken();
+
+            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
+            capMap(this.authCodes, MAX_AUTH_CODES);
+            this.authCodes.set(authCode, {
+                client_id,
+                redirect_uri,
+                code_challenge,
+                code_challenge_method,
+                scope,
+                created_at: Date.now()
+            });
+
+            console.error('[OAuth] Authorization code generated, redirecting to client');
+
+            // Redirect back to Claude with authorization code
+            const redirectUrl = new URL(redirect_uri);
+            redirectUrl.searchParams.append('code', authCode);
+            if (state) redirectUrl.searchParams.append('state', state);
+
+            res.redirect(redirectUrl.toString());
+        };
+
         // OAuth Authorization Endpoint (Authorization Code Flow)
-        app.get('/oauth/authorize', (req, res) => {
+        app.get('/oauth/authorize', authorizeRateLimit, (req, res) => {
             console.error('[OAuth] Authorization request received');
 
             const clientId = process.env.OAUTH_CLIENT_ID;
@@ -2555,32 +2727,67 @@ class YahooMailMCPServer {
                 return res.status(400).send('PKCE code_challenge with code_challenge_method=S256 is required');
             }
 
-            // Generate authorization code
-            const authCode = randomToken();
+            const params = { client_id, redirect_uri, state, code_challenge, code_challenge_method, scope };
 
-            // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            capMap(this.authCodes, MAX_AUTH_CODES);
-            this.authCodes.set(authCode, {
-                client_id,
-                redirect_uri,
-                code_challenge,
-                code_challenge_method,
-                scope,
-                created_at: Date.now()
-            });
+            // No owner password configured: approve automatically (see startup warning)
+            if (!approvalPassword) {
+                return issueAuthCodeRedirect(res, params);
+            }
 
-            console.error('[OAuth] Authorization code generated, redirecting to client');
+            // Hold the validated request server-side, keyed by a single-use nonce that the
+            // consent form must echo back (CSRF protection), and ask the owner to approve
+            const nonce = randomToken();
+            capMap(pendingConsents, MAX_PENDING_CONSENTS);
+            pendingConsents.set(nonce, { ...params, created_at: Date.now(), attempts: 0 });
+            console.error('[OAuth] Awaiting owner approval');
+            renderConsentPage(res, nonce, params);
+        });
 
-            // Redirect back to Claude with authorization code
-            const redirectUrl = new URL(redirect_uri);
-            redirectUrl.searchParams.append('code', authCode);
-            if (state) redirectUrl.searchParams.append('state', state);
+        // Owner-consent form submission (only when OAUTH_APPROVAL_PASSWORD is set)
+        app.post('/oauth/authorize', consentRateLimit, express.urlencoded({ extended: false, limit: '10kb' }), (req, res) => {
+            if (!approvalPassword) {
+                return res.status(404).send('Not found');
+            }
 
-            res.redirect(redirectUrl.toString());
+            const { nonce, action, password } = req.body || {};
+            const pending = typeof nonce === 'string' ? pendingConsents.get(nonce) : undefined;
+            if (!pending || Date.now() - pending.created_at > CONSENT_TTL_MS) {
+                if (pending) pendingConsents.delete(nonce);
+                console.error('[OAuth] Consent submission with unknown or expired nonce');
+                return res.status(400).send('Authorization request is invalid or has expired. Start again from your client.');
+            }
+
+            if (action === 'deny') {
+                pendingConsents.delete(nonce);
+                console.error('[OAuth] Owner denied authorization request');
+                const redirectUrl = new URL(pending.redirect_uri);
+                redirectUrl.searchParams.append('error', 'access_denied');
+                if (pending.state) redirectUrl.searchParams.append('state', pending.state);
+                return res.redirect(redirectUrl.toString());
+            }
+
+            if (action !== 'approve') {
+                return res.status(400).send('Invalid action');
+            }
+
+            if (!checkApprovalPassword(password)) {
+                pending.attempts++;
+                console.error('[OAuth] Owner approval failed - wrong password');
+                if (pending.attempts >= MAX_APPROVAL_ATTEMPTS) {
+                    pendingConsents.delete(nonce);
+                    return res.status(400).send('Too many failed attempts. Start again from your client.');
+                }
+                return renderConsentPage(res, nonce, pending, { status: 401, error: 'Incorrect password.' });
+            }
+
+            // Approved: consume the nonce and issue the code exactly as the automatic flow does
+            pendingConsents.delete(nonce);
+            console.error('[OAuth] Owner approved authorization request');
+            issueAuthCodeRedirect(res, pending);
         });
 
         // OAuth Token Endpoint (supports both Authorization Code and Client Credentials flows)
-        app.post('/oauth/token', async (req, res) => {
+        app.post('/oauth/token', tokenRateLimit, async (req, res) => {
             console.error('[OAuth] Token request - grant type:', req.body?.grant_type || 'unknown');
 
             const clientId = process.env.OAUTH_CLIENT_ID;
@@ -2732,7 +2939,7 @@ class YahooMailMCPServer {
         });
 
         // SSE endpoint for MCP
-        app.get('/mcp/sse', authenticateMCP, async (req, res) => {
+        app.get('/mcp/sse', mcpRateLimit, authenticateMCP, async (req, res) => {
             try {
                 console.error('[SSE] New connection established from:', req.ip);
                 console.error('[SSE] Origin:', req.headers.origin);
@@ -2769,7 +2976,7 @@ class YahooMailMCPServer {
         });
 
         // Message endpoint for SSE
-        app.post('/mcp/message', authenticateMCP, async (req, res) => {
+        app.post('/mcp/message', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[SSE] Received message on /mcp/message');
             console.error('[SSE] Active transports:', this.transports.size);
 
@@ -2887,7 +3094,7 @@ class YahooMailMCPServer {
             });
         };
 
-        app.post('/mcp', authenticateMCP, async (req, res) => {
+        app.post('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] POST /mcp received');
 
             let transport;
@@ -2945,14 +3152,14 @@ class YahooMailMCPServer {
             await handleStreamable(transport, req, res, req.body);
         });
 
-        app.get('/mcp', authenticateMCP, async (req, res) => {
+        app.get('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] GET /mcp (SSE stream)');
             const transport = getStreamableSession(req, res);
             if (!transport) return;
             await handleStreamable(transport, req, res);
         });
 
-        app.delete('/mcp', authenticateMCP, async (req, res) => {
+        app.delete('/mcp', mcpRateLimit, authenticateMCP, async (req, res) => {
             console.error('[Streamable HTTP] DELETE /mcp (session close)');
             const sessionId = req.headers['mcp-session-id'];
             const transport = getStreamableSession(req, res);
@@ -2961,11 +3168,14 @@ class YahooMailMCPServer {
             streamableTransports.delete(sessionId);
         });
 
-        // Periodically purge expired auth codes/tokens and idle streamable sessions
+        // Periodically purge expired auth codes/tokens/consents and idle streamable sessions
         const sweepInterval = setInterval(() => {
             const now = Date.now();
             for (const [code, data] of this.authCodes) {
                 if (now - data.created_at > AUTH_CODE_TTL_MS) this.authCodes.delete(code);
+            }
+            for (const [nonce, pending] of pendingConsents) {
+                if (now - pending.created_at > CONSENT_TTL_MS) pendingConsents.delete(nonce);
             }
             for (const [token, expiresAt] of this.validTokens) {
                 if (expiresAt <= now) this.validTokens.delete(token);

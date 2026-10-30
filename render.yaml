@@ -32,6 +32,12 @@ services:
         sync: false  # REQUIRED - server refuses to start without it (openssl rand -hex 16)
       - key: OAUTH_CLIENT_SECRET
         sync: false  # REQUIRED - server refuses to start without it (openssl rand -hex 32)
+      - key: OAUTH_APPROVAL_PASSWORD
+        sync: false  # RECOMMENDED - owner password required on /oauth/authorize (openssl rand -base64 24)
+      - key: TRUST_PROXY
+        sync: false  # Set to 1 - Render's proxy sits in front, so rate limits key on X-Forwarded-For
+      # Optional rate-limit tuning (defaults: 10/min OAuth, 120/min MCP per IP; 0 disables):
+      # RATE_LIMIT_OAUTH_PER_MIN, RATE_LIMIT_MCP_PER_MIN, RATE_LIMIT_WINDOW_MS
 
     # Health check configuration
     healthCheckPath: /health

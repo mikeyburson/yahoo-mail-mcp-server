@@ -52,6 +52,10 @@ export function serverEnv(overrides = {}) {
         YAHOO_APP_PASSWORD: 'dummy-app-password',
         OAUTH_CLIENT_ID: CLIENT_ID,
         OAUTH_CLIENT_SECRET: CLIENT_SECRET,
+        // Suites make far more requests per minute than the production limits allow;
+        // test/ratelimit.test.js overrides (or unsets) these to exercise the limiter.
+        RATE_LIMIT_OAUTH_PER_MIN: '100000',
+        RATE_LIMIT_MCP_PER_MIN: '100000',
         ...overrides
     };
     for (const key of Object.keys(env)) {

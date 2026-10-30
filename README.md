@@ -86,6 +86,8 @@ The repo includes a `Dockerfile` (multi-stage `node:24-alpine`, runs as a non-ro
    | `YAHOO_APP_PASSWORD` | yes | App password for the primary account |
    | `OAUTH_CLIENT_ID` | **yes** | Random ID, for example `openssl rand -hex 16` |
    | `OAUTH_CLIENT_SECRET` | **yes** | Strong random secret, for example `openssl rand -hex 32` |
+   | `OAUTH_APPROVAL_PASSWORD` | recommended | Owner password for the consent page at `/oauth/authorize`, for example `openssl rand -base64 24` |
+   | `TRUST_PROXY` | recommended | Set `1` on Render so per-IP rate limits see the real client IP |
    | `YAHOO_EMAIL_2` | no | Secondary Yahoo address (for `account: 2`) |
    | `YAHOO_APP_PASSWORD_2` | no | App password for the secondary account |
 
@@ -120,7 +122,7 @@ HTTP mode exposes your mailbox to the internet, so it **fails closed**:
 
 **Limitations to understand before you deploy:**
 
-- **`/oauth/authorize` approves automatically.** There's no login or consent screen. Any client that knows the client ID and uses an allowed redirect URI receives a code. A token, though, requires the **client secret** at `/oauth/token`. Security therefore depends on keeping `OAUTH_CLIENT_SECRET` secret and strong. If it leaks, rotate it in Render and update the connector.
+- **`/oauth/authorize` approves automatically unless `OAUTH_APPROVAL_PASSWORD` is set.** With it set, a consent page asks for that password before a code is issued (single-use nonce, 5 attempts, constant-time check). Without it, any client that knows the client ID and uses an allowed redirect URI receives a code. A token, though, requires the **client secret** at `/oauth/token`. Security therefore depends on keeping `OAUTH_CLIENT_SECRET` secret and strong. If it leaks, rotate it in Render and update the connector.
 - **The `client_credentials` grant is enabled.** Anyone with the ID and secret can get a token directly. This is useful for testing with `curl`, and it's another reason to protect the secret.
 - **Tokens live in memory.** A restart or redeploy (including a Render spin-down) invalidates every token, and Claude has to authorize again. Run a single instance (`numInstances: 1` in `render.yaml`).
 
@@ -141,6 +143,11 @@ The server **doesn't** append a copy to your Sent folder. It relies on Yahoo sav
 | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` | none | **Required in HTTP mode.** Not used in stdio mode. |
 | `OAUTH_ALLOWED_REDIRECT_URIS` | empty | Extra exact redirect URIs, comma-separated. |
 | `CORS_ALLOWED_ORIGINS` | `https://claude.ai,https://claude.com` | Allowed browser origins, comma-separated. |
+| `OAUTH_APPROVAL_PASSWORD` | unset | Enables the owner consent page at `/oauth/authorize`. Unset = auto-approve, with a startup warning. |
+| `TRUST_PROXY` | unset | Express `trust proxy`. Set `1` behind Render's proxy; leave unset for direct connections (otherwise IPs can be spoofed). |
+| `RATE_LIMIT_OAUTH_PER_MIN` | `10` | Per-IP limit for GET/POST `/oauth/authorize` and POST `/oauth/token`, each counted separately (`0` disables). |
+| `RATE_LIMIT_MCP_PER_MIN` | `120` | Per-IP limit across `/mcp`, `/mcp/sse`, `/mcp/message` (`0` disables). |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window in milliseconds. |
 | `NODE_ENV` | `development` | Only used in logs. |
 
 Locally, the server reads `.env` from the current directory (see `.env.example`). Don't commit `.env`.
