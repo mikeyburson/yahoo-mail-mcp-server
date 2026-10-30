@@ -1,6 +1,6 @@
 {
   "name": "yahoo-mail-mcp",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Yahoo Mail MCP Server - Full email management via IMAP",
   "type": "module",
   "main": "server.js",
