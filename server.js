@@ -25,7 +25,7 @@ import dotenv from 'dotenv';
 // quiet: dotenv 17 otherwise logs a banner to stdout, corrupting the stdio JSON-RPC stream
 dotenv.config({ quiet: true });
 
-// Maximum attachment size returned (base64-encoded) by get_attachments
+// Maximum decoded attachment size get_attachments will return (checked before base64 encoding)
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 class YahooMailMCPServer {
@@ -1548,25 +1548,32 @@ class YahooMailMCPServer {
     extractBodyText(parsed, maxChars = 20000) {
         let body = parsed.text;
         if (!body && parsed.html) {
-            body = parsed.html
-                .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
-                .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6])>/gi, '\n')
-                .replace(/<[^>]*>/g, '')
-                .replace(/&nbsp;/gi, ' ')
-                .replace(/&lt;/gi, '<')
-                .replace(/&gt;/gi, '>')
-                .replace(/&quot;/gi, '"')
-                .replace(/&#39;/gi, "'")
-                .replace(/&amp;/gi, '&')
-                .replace(/[ \t]+/g, ' ')
-                .replace(/\n\s*\n\s*\n+/g, '\n\n')
-                .trim();
+            body = this.htmlToText(parsed.html);
         }
         if (!body) return 'No content available';
         if (body.length > maxChars) {
             body = `${body.slice(0, maxChars)}\n\n[truncated: showing first ${maxChars} of ${body.length} characters]`;
         }
         return body;
+    }
+
+    /**
+     * Helper: Strip tags from html, keeping line breaks and decoding common entities
+     */
+    htmlToText(html) {
+        return String(html)
+            .replace(/<(style|script|head)[^>]*>[\s\S]*?<\/\1>/gi, '')
+            .replace(/<br\s*\/?>|<\/(p|div|tr|li|h[1-6])>/gi, '\n')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&#39;/gi, "'")
+            .replace(/&amp;/gi, '&')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n\s*\n\s*\n+/g, '\n\n')
+            .trim();
     }
 
     /**
@@ -1660,9 +1667,7 @@ class YahooMailMCPServer {
      * Get folder message counts via IMAP STATUS (does not open/select the folder)
      */
     async getMailboxStats(folder = 'INBOX', account = 1) {
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.status(folder, (err, box) => {
                 imap.end();
 
@@ -1692,9 +1697,7 @@ class YahooMailMCPServer {
      * Helper: Fetch a single raw message (as a Buffer) by UID
      */
     async fetchRawMessage(uid, folder = 'INBOX', account = 1) {
-        const imap = await this.createImapConnection(account);
-
-        return new Promise((resolve, reject) => {
+        return this.withImap(account, (imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {  // true = read-only mode
                 if (err) {
                     imap.end();
@@ -1861,7 +1864,17 @@ class YahooMailMCPServer {
                 return { addresses: [], error: `${fieldName} must be an array of email address strings` };
             }
 
-            for (const parsed of addressparser(item, { flatten: true })) {
+            const parsedList = addressparser(item, { flatten: true });
+            const atCount = (item.match(/@/g) || []).length;
+            if (atCount > parsedList.length || parsedList.some(p => (p.name || '').includes('@'))) {
+                return {
+                    addresses: [],
+                    error: `${fieldName} could not be parsed unambiguously: "${item}". ` +
+                        'Separate multiple addresses with commas or pass them as an array.'
+                };
+            }
+
+            for (const parsed of parsedList) {
                 const address = (parsed.address || '').trim();
 
                 if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(address)) {
@@ -1968,7 +1981,8 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
 
@@ -2028,7 +2042,8 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
 
@@ -2089,7 +2104,7 @@ class YahooMailMCPServer {
             ? original.date.toUTCString()
             : 'an earlier date';
         const attribution = `On ${originalDate}, ${original.from?.text || 'the sender'} wrote:`;
-        const originalText = (original.text || '').replace(/\r\n?/g, '\n').trimEnd();
+        const originalText = (original.text || (original.html ? this.htmlToText(original.html) : '')).replace(/\r\n?/g, '\n').trimEnd();
         const quotedText = originalText
             .split('\n')
             .map(line => (line ? `> ${line}` : '>'))
@@ -2177,7 +2192,8 @@ class YahooMailMCPServer {
                 content: [{
                     type: 'text',
                     text: `Error: ${validationError}`
-                }]
+                }],
+                isError: true
             };
         }
 
@@ -2225,14 +2241,26 @@ class YahooMailMCPServer {
             }
             selected = index;
         } else {
-            selected = attachments.findIndex(att => att.filename === filename);
-            if (selected === -1) {
-                selected = attachments.findIndex(att => (att.filename || '').toLowerCase() === filename.toLowerCase());
+            let matches = summaries.filter(s => s.filename === filename);
+            if (matches.length === 0) {
+                matches = summaries.filter(s => (s.filename || '').toLowerCase() === filename.toLowerCase());
             }
-            if (selected === -1) {
+            if (matches.length === 0) {
                 const available = summaries.map(s => s.filename || `(unnamed, index ${s.index})`).join(', ');
                 throw new Error(`No attachment named "${filename}" in email UID ${uid}. Available: ${available}`);
             }
+            if (matches.length > 1) {
+                const attachmentMatches = matches.filter(s => s.disposition === 'attachment');
+                if (attachmentMatches.length === 1) {
+                    matches = attachmentMatches;
+                } else {
+                    throw new Error(
+                        `Multiple attachments named "${filename}" in email UID ${uid} ` +
+                        `(indexes: ${matches.map(s => s.index).join(', ')}). Pass index instead.`
+                    );
+                }
+            }
+            selected = matches[0].index;
         }
 
         const summary = summaries[selected];

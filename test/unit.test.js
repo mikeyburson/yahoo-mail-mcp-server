@@ -278,3 +278,78 @@ describe('account resolution', () => {
         });
     });
 });
+
+describe('parseAddressList', () => {
+    it('rejects space-separated addresses instead of dropping one', () => {
+        const result = pure.parseAddressList('alice@x.com bob@y.com', 'to');
+        assert.equal(result.addresses.length, 0);
+        assert.match(result.error, /to could not be parsed unambiguously/);
+    });
+
+    it('rejects an entry whose display name contains @', () => {
+        const result = pure.parseAddressList('"bob@y.com" <alice@x.com>', 'cc');
+        assert.match(result.error, /cc could not be parsed unambiguously/);
+    });
+
+    it('accepts comma-separated and named addresses', () => {
+        const result = pure.parseAddressList(['Alice <alice@x.com>, bob@y.com'], 'to');
+        assert.equal(result.error, null);
+        assert.deepEqual(result.addresses, [
+            { name: 'Alice', address: 'alice@x.com' },
+            { name: '', address: 'bob@y.com' }
+        ]);
+    });
+});
+
+describe('early validation errors set isError', () => {
+    it('send_email', async () => {
+        const result = await pure.sendEmail({ to: 'alice@x.com bob@y.com', subject: 's', text: 't' });
+        assert.equal(result.isError, true);
+    });
+
+    it('reply_email', async () => {
+        const result = await pure.replyEmail(0, { text: 't' });
+        assert.equal(result.isError, true);
+    });
+
+    it('get_attachments', async () => {
+        const result = await pure.getAttachments(1, { index: -1 });
+        assert.equal(result.isError, true);
+    });
+});
+
+describe('getAttachments filename lookup', () => {
+    const part = (disposition, body) => [
+        '--b',
+        'Content-Type: application/octet-stream',
+        `Content-Disposition: ${disposition}; filename="a.txt"`,
+        '',
+        body
+    ].join('\r\n');
+    const raw = (...parts) => Buffer.from([
+        'From: x@y.com',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="b"',
+        '',
+        ...parts,
+        '--b--',
+        ''
+    ].join('\r\n'));
+
+    let original;
+    beforeEach(() => { original = pure.fetchRawMessage; });
+    afterEach(() => { pure.fetchRawMessage = original; });
+
+    it('prefers the attachment-disposition part among duplicates', async () => {
+        pure.fetchRawMessage = async () => ({ raw: raw(part('inline', 'one'), part('attachment', 'two')) });
+        const result = await pure.getAttachments(1, { filename: 'a.txt' });
+        const data = JSON.parse(text(result));
+        assert.equal(data.index, 1);
+        assert.equal(Buffer.from(data.contentBase64, 'base64').toString(), 'two');
+    });
+
+    it('errors with indexes when still ambiguous', async () => {
+        pure.fetchRawMessage = async () => ({ raw: raw(part('attachment', 'one'), part('attachment', 'two')) });
+        await assert.rejects(pure.getAttachments(1, { filename: 'a.txt' }), /indexes: 0, 1/);
+    });
+});
