@@ -2194,73 +2194,15 @@ class YahooMailMCPServer {
         const { email } = this.getAccountCredentials(account);
         const ownAddress = email.toLowerCase();
 
-        const fromList = this.flattenParsedAddresses(original.from);
-        const replyToList = this.flattenParsedAddresses(original.replyTo);
-        const toList = this.flattenParsedAddresses(original.to);
-        const ccList = this.flattenParsedAddresses(original.cc);
-
-        // Replying to our own message (e.g., from Sent) goes back to its original recipients
-        const sentByMe = fromList.some(a => a.address.toLowerCase() === ownAddress);
-        let primaryRecipients;
-        if (sentByMe && toList.length > 0) {
-            primaryRecipients = toList;
-        } else if (replyToList.length > 0) {
-            primaryRecipients = replyToList;
-        } else {
-            primaryRecipients = fromList;
-        }
-
-        const replyTo = this.dedupeAddresses(primaryRecipients);
-        if (replyTo.length === 0) {
-            throw new Error(`Email UID ${uid} has no sender address to reply to`);
-        }
-
-        // Reply-all: everyone on the original To/CC, minus ourselves and the primary recipients
-        const replyCc = replyAll
-            ? this.dedupeAddresses([...toList, ...ccList], [ownAddress, ...replyTo.map(a => a.address)])
-            : [];
-
-        // Subject: add "Re:" unless already present (avoid "Re: Re:")
-        const originalSubject = (original.subject || '').replace(/[\r\n]+/g, ' ').trim();
-        const replySubject = /^re\s*(\[\d+\])?\s*:/i.test(originalSubject)
-            ? originalSubject
-            : `Re: ${originalSubject}`.trim();
-
-        // Threading headers (RFC 5322 section 3.6.4)
-        const originalMessageId = original.messageId || null;
-        let references = [];
-        if (original.references) {
-            references = Array.isArray(original.references)
-                ? [...original.references]
-                : String(original.references).split(/\s+/);
-        } else if (original.inReplyTo) {
-            references = [original.inReplyTo];
-        }
-        references = references.filter(Boolean);
-        if (originalMessageId && !references.includes(originalMessageId)) {
-            references.push(originalMessageId);
-        }
-
-        // Quote the original message
-        const originalDate = original.date instanceof Date && !isNaN(original.date)
-            ? original.date.toUTCString()
-            : 'an earlier date';
-        const attribution = `On ${originalDate}, ${original.from?.text || 'the sender'} wrote:`;
-        const originalText = (original.text || (original.html ? this.htmlToText(original.html) : '')).replace(/\r\n?/g, '\n').trimEnd();
-        const quotedText = originalText
-            .split('\n')
-            .map(line => (line ? `> ${line}` : '>'))
-            .join('\n');
-
-        const replyText = `${text}\n\n${attribution}\n${quotedText}`;
-
-        let replyHtml;
-        if (html) {
-            replyHtml = `${html}\n<br><br>\n<div>${this.escapeHtml(attribution)}</div>\n` +
-                `<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex">\n` +
-                `${this.escapeHtml(originalText).replace(/\n/g, '<br>\n')}\n` +
-                `</blockquote>`;
-        }
+        const {
+            to: replyTo,
+            cc: replyCc,
+            subject: replySubject,
+            text: replyText,
+            html: replyHtml,
+            inReplyTo: originalMessageId,
+            references
+        } = this.buildReplyFields(original, ownAddress, { text, html, replyAll, uid });
 
         const mailOptions = {
             to: replyTo,
@@ -2612,7 +2554,7 @@ class YahooMailMCPServer {
             ? original.date.toUTCString()
             : 'an earlier date';
         const attribution = `On ${originalDate}, ${original.from?.text || 'the sender'} wrote:`;
-        const originalText = (original.text || '').replace(/\r\n?/g, '\n').trimEnd();
+        const originalText = (original.text || (original.html ? this.htmlToText(original.html) : '')).replace(/\r\n?/g, '\n').trimEnd();
         const quotedText = originalText
             .split('\n')
             .map(line => (line ? `> ${line}` : '>'))
