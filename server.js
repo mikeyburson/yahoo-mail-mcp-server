@@ -28,6 +28,8 @@ dotenv.config({ quiet: true });
 
 // Maximum decoded attachment size get_attachments will return (checked before base64 encoding)
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+// Largest whole message fetchRawMessage will download (checked via RFC822.SIZE before the body)
+const MAX_RAW_MESSAGE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
 // get_thread limits: messages returned, snippet length, and Message-IDs searched for
 const MAX_THREAD_MESSAGES = 50;
@@ -1811,6 +1813,29 @@ class YahooMailMCPServer {
                     return;
                 }
 
+                // Check RFC822.SIZE first so an oversized message is never downloaded into memory
+                let size = null;
+                const sizeFetch = imap.fetch(uid.toString(), { size: true });
+                sizeFetch.on('message', (msg) => {
+                    msg.once('attributes', (a) => { size = a.size; });
+                });
+                sizeFetch.once('error', (err) => {
+                    imap.end();
+                    reject(err);
+                });
+                sizeFetch.once('end', () => {
+                    if (typeof size === 'number' && size > MAX_RAW_MESSAGE_SIZE_BYTES) {
+                        imap.end();
+                        reject(new Error(
+                            `Message UID ${uid} is too large to process (${(size / 1024 / 1024).toFixed(1)} MB; ` +
+                            `limit is ${MAX_RAW_MESSAGE_SIZE_BYTES / 1024 / 1024} MB).`
+                        ));
+                        return;
+                    }
+                    fetchBody();
+                });
+
+                const fetchBody = () => {
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(uid.toString(), {
                     bodies: '',
@@ -1851,6 +1876,7 @@ class YahooMailMCPServer {
 
                     resolve({ raw: Buffer.concat(chunks), attrs: attrs });
                 });
+                };
             });
         });
     }
@@ -1968,6 +1994,16 @@ class YahooMailMCPServer {
         for (const item of items) {
             if (typeof item !== 'string') {
                 return { addresses: [], error: `${fieldName} must be an array of email address strings` };
+            }
+
+            // Group syntax ("team: a@x.com, b@y.com;") makes addressparser silently rewrite the
+            // recipient list, and CR/LF could inject headers - reject them outright.
+            if (/[:;\r\n]/.test(item)) {
+                return {
+                    addresses: [],
+                    error: `${fieldName} contains an unsupported character (":", ";", CR or LF): "${item.replace(/[\r\n]/g, ' ')}". ` +
+                        'Group syntax is not supported; list each address separately.'
+                };
             }
 
             const parsedList = addressparser(item, { flatten: true });
@@ -3024,10 +3060,16 @@ class YahooMailMCPServer {
         // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so req.ip is the client address
         // from X-Forwarded-For instead of the proxy's. Never trusted unless explicitly configured.
         const trustProxy = process.env.TRUST_PROXY;
-        if (trustProxy && trustProxy !== 'false') {
-            const value = /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy === 'true' ? true : trustProxy;
-            app.set('trust proxy', value);
-            console.error('[Server] trust proxy:', value);
+        // Only an integer hop count is accepted: `true` would trust a client-supplied
+        // X-Forwarded-For, letting anyone spoof their IP (or lock others out of the rate limit).
+        if (trustProxy && trustProxy !== 'false' && trustProxy !== '0') {
+            if (/^\d+$/.test(trustProxy)) {
+                app.set('trust proxy', Number(trustProxy));
+                console.error('[Server] trust proxy hops:', Number(trustProxy));
+            } else {
+                console.error(`[Server] WARNING: ignoring TRUST_PROXY=${JSON.stringify(trustProxy)} - it must be an ` +
+                    'integer hop count (e.g. 1). Trust proxy stays off.');
+            }
         }
 
         const { isInitializeRequest } = await import('@modelcontextprotocol/sdk/types.js');
@@ -3315,7 +3357,8 @@ ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                // client_credentials skips the consent step, so it is only offered without a password
+                grant_types_supported: approvalPassword ? ['authorization_code'] : ['authorization_code', 'client_credentials'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -3596,6 +3639,14 @@ ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
 
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
+                // This grant never passes through the owner-consent form, so it would bypass
+                // OAUTH_APPROVAL_PASSWORD. Refuse it whenever that password is configured.
+                if (approvalPassword) {
+                    return res.status(400).json({
+                        error: 'unauthorized_client',
+                        error_description: 'client_credentials is disabled while OAUTH_APPROVAL_PASSWORD is set; use authorization_code'
+                    });
+                }
                 // Generate access token
                 const accessToken = issueAccessToken();
 

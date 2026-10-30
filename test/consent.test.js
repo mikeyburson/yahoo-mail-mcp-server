@@ -5,7 +5,9 @@ import {
     makePkce,
     authorize,
     exchangeCode,
+    tokenRequest,
     CLIENT_ID,
+    CLIENT_SECRET,
     REDIRECT_URI
 } from './helpers/server.js';
 
@@ -60,6 +62,22 @@ describe('owner consent on /oauth/authorize (OAUTH_APPROVAL_PASSWORD set)', () =
 
     it('does not log the missing-password warning', () => {
         assert.doesNotMatch(srv.stderr(), /OAUTH_APPROVAL_PASSWORD is not set/);
+    });
+
+    it('refuses client_credentials (it would skip the consent step)', async () => {
+        const res = await tokenRequest(srv.baseUrl, {
+            grant_type: 'client_credentials',
+            client_id: CLIENT_ID,
+            client_secret: CLIENT_SECRET
+        });
+        assert.equal(res.status, 400);
+        assert.equal(res.body.error, 'unauthorized_client');
+        assert.equal(res.body.access_token, undefined);
+    });
+
+    it('omits client_credentials from grant_types_supported', async () => {
+        const meta = await (await fetch(`${srv.baseUrl}/.well-known/oauth-authorization-server`)).json();
+        assert.deepEqual(meta.grant_types_supported, ['authorization_code']);
     });
 
     it('renders a consent page instead of redirecting', async () => {

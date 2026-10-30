@@ -299,6 +299,14 @@ describe('parseAddressList', () => {
             { name: '', address: 'bob@y.com' }
         ]);
     });
+
+    it('rejects group syntax and CR/LF instead of rewriting recipients', () => {
+        for (const input of ['team: a@x.com, b@y.com;', 'a@x.com;b@y.com', 'a@x.com\r\nBcc: c@z.com', 'a@x.com\nb@y.com']) {
+            const result = pure.parseAddressList([input], 'to');
+            assert.deepEqual(result.addresses, [], input);
+            assert.match(result.error, /unsupported character/, input);
+        }
+    });
 });
 
 describe('early validation errors set isError', () => {
