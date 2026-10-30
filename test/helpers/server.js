@@ -34,7 +34,11 @@ export const EXPECTED_TOOLS = [
     'flag_emails',
     'unflag_emails',
     'move_emails',
-    'list_folders'
+    'list_folders',
+    'send_email',
+    'reply_email',
+    'get_attachments',
+    'get_mailbox_stats'
 ];
 
 const DEFAULT_TIMEOUT_MS = 10_000;

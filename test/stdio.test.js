@@ -47,9 +47,7 @@ describe('stdio transport', () => {
         assert.match(srv.stderr(), /running on stdio/);
     });
 
-    it('writes nothing but JSON-RPC messages to stdout', {
-        todo: 'dotenv@17 prints "[dotenv@17.x] injecting env ..." to stdout on dotenv.config(), corrupting the stdio JSON-RPC stream (needs { quiet: true })'
-    }, () => {
+    it('writes nothing but JSON-RPC messages to stdout', () => {
         assert.ok(srv.lines.length >= 4);
         for (const line of srv.lines) {
             let msg;
