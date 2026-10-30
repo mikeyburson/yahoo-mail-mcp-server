@@ -30,7 +30,7 @@ describe('Streamable HTTP transport (/mcp)', () => {
         assert.match(session.sessionId, /^[0-9a-f-]{36}$/);
         const { result } = session.init.messages[0];
         assert.equal(result.protocolVersion, PROTOCOL_VERSION);
-        assert.deepEqual(result.serverInfo, { name: 'yahoo-mail-mcp', version: '3.0.0' });
+        assert.deepEqual(result.serverInfo, { name: 'yahoo-mail-mcp', version: '4.0.0' });
         assert.ok(result.capabilities.tools, 'tools capability advertised');
     });
 

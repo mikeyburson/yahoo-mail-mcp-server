@@ -22,7 +22,7 @@ describe('stdio transport', () => {
         });
         assert.equal(reply.error, undefined);
         assert.equal(reply.result.protocolVersion, PROTOCOL_VERSION);
-        assert.deepEqual(reply.result.serverInfo, { name: 'yahoo-mail-mcp', version: '3.0.0' });
+        assert.deepEqual(reply.result.serverInfo, { name: 'yahoo-mail-mcp', version: '4.0.0' });
         assert.ok(reply.result.capabilities.tools);
         srv.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     });

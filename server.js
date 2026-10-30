@@ -33,7 +33,7 @@ class YahooMailMCPServer {
         this.server = new Server(
             {
                 name: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '4.0.0',
             },
             {
                 capabilities: {
@@ -2719,7 +2719,7 @@ class YahooMailMCPServer {
             res.json({
                 status: 'ok',
                 service: 'yahoo-mail-mcp',
-                version: '3.0.0',
+                version: '4.0.0',
                 timestamp: new Date().toISOString(),
                 environment: {
                     nodeVersion: process.version,
@@ -2814,7 +2814,7 @@ class YahooMailMCPServer {
             const server = new Server(
                 {
                     name: 'yahoo-mail-mcp',
-                    version: '3.0.0',
+                    version: '4.0.0',
                 },
                 {
                     capabilities: {
@@ -2992,7 +2992,7 @@ class YahooMailMCPServer {
         app.get('/', (req, res) => {
             res.json({
                 name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
+                version: '4.0.0',
                 description: 'MCP server for Yahoo Mail access via IMAP',
                 endpoints: {
                     health: '/health',

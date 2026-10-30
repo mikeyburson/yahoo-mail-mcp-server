@@ -24,7 +24,7 @@ describe('HTTP mode: health, root and discovery endpoints', () => {
         const body = await getJson('/health');
         assert.equal(body.status, 'ok');
         assert.equal(body.service, 'yahoo-mail-mcp');
-        assert.equal(body.version, '3.0.0');
+        assert.equal(body.version, '4.0.0');
         assert.ok(!Number.isNaN(Date.parse(body.timestamp)), 'timestamp is an ISO date');
         assert.deepEqual(body.environment, {
             nodeVersion: process.version,
@@ -50,7 +50,7 @@ describe('HTTP mode: health, root and discovery endpoints', () => {
     it('/ describes the server', async () => {
         const body = await getJson('/');
         assert.equal(body.name, 'Yahoo Mail MCP Server');
-        assert.equal(body.version, '3.0.0');
+        assert.equal(body.version, '4.0.0');
         assert.equal(body.endpoints.health, '/health');
         assert.ok(Array.isArray(body.tools));
     });
